@@ -51,6 +51,7 @@ State::State(uc_engine *_uc, uint64_t cache_key):uc(_uc) {
 	arch = *((uc_arch*)uc); // unicorn hides all its internals...
 	mode = *((uc_mode*)((uc_arch*)uc + 1));
 	curr_block_details.reset();
+	one_block_executed = false;
 }
 
 /*
@@ -145,11 +146,6 @@ void State::stop(stop_t reason, bool do_commit) {
 	stop_details.block_size = curr_block_details.block_size;
 	if ((reason == STOP_SYSCALL) || do_commit) {
 		commit();
-	}
-	else if ((reason != STOP_NORMAL) && (reason != STOP_STOPPOINT)) {
-		// Stop reason is not NORMAL, STOPPOINT or SYSCALL. Rollback.
-		// EXECNONE, ZEROPAGE, NOSTART, ZERO_DIV, NODECODE and HLT are never passed to this function.
-		rollback();
 	}
 	uc_emu_stop(uc);
 	// Prepare details of blocks with symbolic instructions to re-execute for returning to state plugin
@@ -261,9 +257,14 @@ void State::commit() {
 	// Clear all block level taint status trackers and symbolic instruction list
 	block_symbolic_registers.clear();
 	block_concrete_registers.clear();
+	block_symbolic_temps.clear();
+	block_start_reg_values.clear();
 	curr_block_details.reset();
-	instr_slice_details_map.clear();
-	mem_reads_map.clear();
+	block_instr_slice_details_map.clear();
+	block_mem_reads_data.clear();
+	block_mem_reads_map.clear();
+	block_mem_writes_data.clear();
+	block_mem_writes_addrs.clear();
 	mem_writes_taint_map.clear();
 	return;
 }
@@ -292,6 +293,52 @@ void State::rollback() {
 
 	if (track_bbls) bbl_addrs.pop_back();
 	if (track_stack) stack_pointers.pop_back();
+}
+
+void State::save_memory_record(address_t address, int size) {
+	// If the write spans a page, chop it up
+	if ((address & 0xfff) + size > 0x1000) {
+		int chopsize = 0x1000 - (address & 0xfff);
+		save_memory_record(address, chopsize);
+		if (stopped) {
+			return;
+		}
+		save_memory_record(address + chopsize, size - chopsize);
+		return;
+	}
+	// From here, we are definitely only dealing with one page
+
+	mem_write_t record;
+	record.address = address;
+	record.size = size;
+	uc_err err = uc_mem_read(uc, address, record.value, size);
+	if (err == UC_ERR_READ_UNMAPPED) {
+		if (py_mem_callback(uc, UC_MEM_WRITE_UNMAPPED, address, size, 0, (void*)1)) {
+			err = UC_ERR_OK;
+		}
+	}
+	if (err) {
+		stop(STOP_ERROR);
+		return;
+	}
+	auto pair = page_lookup(address);
+	taint_t *bitmap = pair.first;
+	uint8_t *data = pair.second;
+	int start = address & 0xFFF;
+	int end = (address + size - 1) & 0xFFF;
+	short clean;
+
+	if (!bitmap) {
+		// We should never have a missing bitmap because we explicitly called the callback!
+		printf("This should never happen, right? %#" PRIx64 "\n", address);
+		abort();
+	}
+
+	for (auto i = start; i <= end; i++) {
+		record.previous_taint.push_back(bitmap[i]);
+	}
+	mem_writes.push_back(record);
+	return;
 }
 
 /*
@@ -531,33 +578,80 @@ int64_t State::find_tainted(address_t address, int size) {
 	return -1;
 }
 
-void State::handle_write(address_t address, int size, bool is_interrupt) {
+void State::handle_read_hook(address_t address, int size) {
+	memory_value_t memory_read_value;
+
+	memory_read_value.reset();
+	memory_read_value.address = address;
+	memory_read_value.size = size;
+	auto mem_write_entry_it = block_mem_writes_addrs.find(address);
+	if (mem_write_entry_it != block_mem_writes_addrs.end()) {
+		// This address was previous modified in this block. Hence, current taint status may not be correct
+		if (mem_write_entry_it->second) {
+			// Write is definitely concrete => read is definitely concrete.
+			memory_read_value.is_value_symbolic = false;
+		}
+		else {
+			// Write could be symbolic => read could also be symbolic. For now, assume it is symbolic.
+			memory_read_value.is_value_symbolic = true;
+			curr_block_details.has_symbolic_mem_read = true;
+			memory_read_value.recheck_taint_status = true;
+		}
+	}
+	else {
+		// There was no write in current block to this address and current taint status is accurate.
+		auto tainted = find_tainted(address, size);
+		if (tainted != -1) {
+			if (is_symbolic_tracking_disabled()) {
+				// Symbolic register tracking is disabled but memory location has symbolic data.
+				// We switch to VEX engine then.
+				stop(STOP_SYMBOLIC_READ_SYMBOLIC_TRACKING_DISABLED);
+				return;
+			}
+			memory_read_value.is_value_symbolic = true;
+			curr_block_details.has_symbolic_mem_read = true;
+		}
+		else {
+			memory_read_value.is_value_symbolic = false;
+		}
+	}
+	// Save value if it is concrete or possibly concrete
+	if (!memory_read_value.is_value_symbolic || memory_read_value.recheck_taint_status) {
+		read_memory_value(address, size, memory_read_value.value, MAX_MEM_ACCESS_SIZE);
+	}
+	block_mem_reads_data.emplace_back(memory_read_value);
+}
+
+void State::handle_write_hook(address_t address, int size) {
+	bool is_write_definitely_concrete = false;
+	if ((symbolic_registers.size() == 0) && !curr_block_details.has_symbolic_mem_read) {
+		is_write_definitely_concrete = true;
+	}
+	block_mem_writes_data.emplace_back(std::make_pair(address, size));
+	auto entry_it = block_mem_writes_addrs.find(address);
+	if (entry_it == block_mem_writes_addrs.end()) {
+		block_mem_writes_addrs.emplace(address, is_write_definitely_concrete);
+	}
+	else {
+		entry_it->second &= is_write_definitely_concrete;
+	}
+	save_memory_record(address, size);
+	return;
+}
+
+void State::propagate_write_taint(address_t address, int size, bool is_dst_symbolic, address_t instr_addr) {
 	// If the write spans a page, chop it up
 	if ((address & 0xfff) + size > 0x1000) {
 		int chopsize = 0x1000 - (address & 0xfff);
-		handle_write(address, chopsize, is_interrupt);
+		propagate_write_taint(address, chopsize, is_dst_symbolic, instr_addr);
 		if (stopped) {
 			return;
 		}
-		handle_write(address + chopsize, size - chopsize, is_interrupt);
+		propagate_write_taint(address + chopsize, size - chopsize, is_dst_symbolic, instr_addr);
 		return;
 	}
 
 	// From here, we are definitely only dealing with one page
-
-	mem_write_t record;
-	record.address = address;
-	record.size = size;
-	uc_err err = uc_mem_read(uc, address, record.value, size);
-	if (err == UC_ERR_READ_UNMAPPED) {
-		if (py_mem_callback(uc, UC_MEM_WRITE_UNMAPPED, address, size, 0, (void*)1)) {
-			err = UC_ERR_OK;
-		}
-	}
-	if (err) {
-		stop(STOP_ERROR);
-		return;
-	}
 
 	auto pair = page_lookup(address);
 	taint_t *bitmap = pair.first;
@@ -565,44 +659,18 @@ void State::handle_write(address_t address, int size, bool is_interrupt) {
 	int start = address & 0xFFF;
 	int end = (address + size - 1) & 0xFFF;
 	short clean;
-	address_t curr_instr_addr;
-	bool is_dst_symbolic;
 
 	if (!bitmap) {
-		// We should never have a missing bitmap because we explicitly called the callback!
+		// We should never have a missing bitmap because callback should have been invoked in save_memory_record!
 		printf("This should never happen, right? %#" PRIx64 "\n", address);
 		abort();
 	}
 
 	clean = 0;
-	if (is_interrupt || is_symbolic_tracking_disabled() || curr_block_details.vex_lift_failed) {
-		// If symbolic tracking is disabled, all writes are concrete
-		// is_interrupt flag is a workaround for CGC transmit syscall, which never passes symbolic data
-		// If VEX lift failed, then write is definitely concrete since execution continues only
-		// if no symbolic data is present
-		is_dst_symbolic = false;
-	}
-	else {
-		curr_instr_addr = get_instruction_pointer();
-		auto mem_writes_taint_map_entry = mem_writes_taint_map.find(curr_instr_addr);
-		if (mem_writes_taint_map_entry != mem_writes_taint_map.end()) {
-			is_dst_symbolic = mem_writes_taint_map_entry->second;
-		}
-		// We did not find a memory write at this instruction when processing the VEX statements.
-		// This likely means unicorn reported the current PC register value wrong.
-		// If there are no symbolic registers, assume write is concrete and continue concrete execution else stop.
-		else if ((symbolic_registers.size() == 0) && (block_symbolic_registers.size() == 0)) {
-			is_dst_symbolic = false;
-		}
-		else {
-			stop(STOP_UNKNOWN_MEMORY_WRITE);
-			return;
-		}
-	}
 	if (is_dst_symbolic) {
 		// Save the details of memory location written to in the instruction details
 		for (auto &symbolic_instr: curr_block_details.symbolic_instrs) {
-			if (symbolic_instr.instr_addr == curr_instr_addr) {
+			if (symbolic_instr.instr_addr == instr_addr) {
 				symbolic_instr.mem_write_addr = address;
 				symbolic_instr.mem_write_size = size;
 				break;
@@ -660,9 +728,6 @@ void State::handle_write(address_t address, int size, bool is_interrupt) {
 					// Currrent write fully overwrites the previous written symbolic value and so the symbolic write
 					// instruction need not be re-executed
 					// TODO: How to handle partial overwrite?
-					// TODO: If this block is not fully executed in unicorn before control returns to python land,
-					// the state will be inconsistent until this concrete memory write is executed. If this happens,
-					// the symbolic memory write should be removed from list of instructions to re-execute in commit.
 					instrs_to_erase_it.emplace_back(sym_instr_it);
 				}
 			}
@@ -673,7 +738,6 @@ void State::handle_write(address_t address, int size, bool is_interrupt) {
 	}
 	if (data == NULL) {
 		for (auto i = start; i <= end; i++) {
-			record.previous_taint.push_back(bitmap[i]);
 			if (is_dst_symbolic) {
 				// Don't mark as TAINT_DIRTY since we don't want to sync it back to angr
 				// Also, no need to set clean: rollback will set it to TAINT_NONE which
@@ -688,7 +752,6 @@ void State::handle_write(address_t address, int size, bool is_interrupt) {
 	}
 	else {
 		for (auto i = start; i <= end; i++) {
-			record.previous_taint.push_back(bitmap[i]);
 			if (is_dst_symbolic) {
 				// Don't mark as TAINT_DIRTY since we don't want to sync it back to angr
 				// Also, no need to set clean: rollback will set it to TAINT_NONE which
@@ -701,7 +764,6 @@ void State::handle_write(address_t address, int size, bool is_interrupt) {
 			}
 		}
 	}
-	mem_writes.push_back(record);
 }
 
 void State::compute_slice_of_instrs(address_t instr_addr, const instruction_taint_entry_t &instr_taint_entry) {
@@ -724,7 +786,7 @@ void State::compute_slice_of_instrs(address_t instr_addr, const instruction_tain
 				// instructions to the slice of this instruction and also any instructions
 				// they depend on
 				for (auto &dep_reg_slice_instr: dep_reg_slice_instrs) {
-					auto& dep_instr_slice_details = instr_slice_details_map.at(dep_reg_slice_instr.instr_addr);
+					auto& dep_instr_slice_details = block_instr_slice_details_map.at(dep_reg_slice_instr.instr_addr);
 					instr_slice_details.concrete_registers.insert(dep_instr_slice_details.concrete_registers.begin(), dep_instr_slice_details.concrete_registers.end());
 					instr_slice_details.dependent_instrs.insert(dep_instr_slice_details.dependent_instrs.begin(), dep_instr_slice_details.dependent_instrs.end());
 					instr_slice_details.dependent_instrs.emplace(dep_reg_slice_instr);
@@ -732,7 +794,7 @@ void State::compute_slice_of_instrs(address_t instr_addr, const instruction_tain
 			}
 		}
 	}
-	instr_slice_details_map.emplace(instr_addr, instr_slice_details);
+	block_instr_slice_details_map.emplace(instr_addr, instr_slice_details);
 	return;
 }
 
@@ -756,7 +818,7 @@ void State::compute_slice_of_instrs_for_vex_temps(instr_details_t &instr) {
 	while (!temps_to_process.empty()) {
 		auto &vex_tmp = temps_to_process.front();
 		if (vex_tmp.second != instr.instr_addr) {
-			auto &tmp_instr_slice = instr_slice_details_map.at(vex_tmp.second);
+			auto &tmp_instr_slice = block_instr_slice_details_map.at(vex_tmp.second);
 			auto &tmp_instr_details = block_taint_entry.block_instrs_taint_data_map.at(vex_tmp.second);
 			for (auto &reg: tmp_instr_slice.concrete_registers) {
 				auto reg_offset = reg.first;
@@ -1412,7 +1474,7 @@ taint_status_result_t State::get_final_taint_status(const std::unordered_set<tai
 				// Address is concrete so we check result of the memory read
 				mem_read_result_t mem_read_result;
 				try {
-					mem_read_result = mem_reads_map.at(taint_source.instr_addr);
+					mem_read_result = block_mem_reads_map.at(taint_source.instr_addr);
 				}
 				catch (std::out_of_range const&) {
 					assert(false && "[sim_unicorn] Taint sink depends on a read not executed yet! This should not happen!");
@@ -1440,6 +1502,22 @@ int32_t State::get_vex_expr_result_size(IRExpr *expr, IRTypeEnv* tyenv) const {
 		return 0;
 	}
 	return sizeofIRType(expr_type);
+}
+
+VEXLiftResult* State::lift_block(address_t block_address, int32_t block_size) {
+	VexRegisterUpdates pxControl = VexRegUpdUnwindregsAtMemAccess;
+	std::unique_ptr<uint8_t[]> instructions(new uint8_t[block_size]);
+	address_t lift_address;
+
+	if ((arch == UC_ARCH_ARM) && is_thumb_mode()) {
+		lift_address = block_address | 1;
+	}
+	else {
+		lift_address = block_address;
+	}
+	uc_mem_read(uc, lift_address, instructions.get(), block_size);
+	curr_block_details.vex_lift_done = true;
+	return vex_lift(vex_guest, vex_archinfo, instructions.get(), lift_address, 99, block_size, 1, 0, 1, 1, 0, pxControl);
 }
 
 void State::mark_register_symbolic(vex_reg_offset_t reg_offset, int64_t reg_size) {
@@ -1539,112 +1617,105 @@ void State::propagate_taints() {
 		// We're not checking symbolic registers so no need to propagate taints
 		return;
 	}
-	auto& block_taint_entry = this->block_taint_cache.at(curr_block_details.block_addr);
-	if (((symbolic_registers.size() > 0) || (block_symbolic_registers.size() > 0))
-		&& block_taint_entry.has_unsupported_stmt_or_expr_type) {
+	VEXLiftResult *lift_ret;
+	auto block_taint_entry_it = block_taint_cache.find(curr_block_details.block_addr);
+	if ((arch == UC_ARCH_ARM) && (block_taint_entry_it == block_taint_cache.end())) {
+		// Lift the block and check if it ends in syscall. Stop execution if it does.
+		// An ARM block ending in a syscall will never have an entry in taint cache since execution immediately stops.
+		lift_ret = lift_block(curr_block_details.block_addr, curr_block_details.block_size);
+		if ((lift_ret == NULL) || (lift_ret->size == 0)) {
+			// Cannot determine if block ends in syscall. Stop execution.
+			stop(STOP_VEX_LIFT_FAILED);
+			return;
+		}
+		if ((arch == UC_ARCH_ARM) && (lift_ret->irsb->jumpkind == Ijk_Sys_syscall)) {
+			// This block invokes a syscall. For now, such blocks are handled by VEX engine.
+			stop(STOP_SYSCALL_ARM);
+			return;
+		}
+	}
+	if (!curr_block_details.has_symbolic_mem_read && (symbolic_registers.size() == 0)) {
+		// No symbolic registers and no symbolic values read from memory. Propagate taint of all writes.
+		for (auto &mem_write: block_mem_writes_data) {
+			// Instruction address can be 0 since write is concrete: only symbolic writes need the address
+			propagate_write_taint(mem_write.first, mem_write.second, false, 0);
+		}
+		return;
+	}
+	if (block_taint_entry_it == block_taint_cache.end()) {
+		// Compute and cache taint sink-source relations for this block
+		if (!curr_block_details.vex_lift_done) {
+			lift_ret = lift_block(curr_block_details.block_addr, curr_block_details.block_size);
+		}
+
+		if ((lift_ret == NULL) || (lift_ret->size == 0)) {
+			// Failed to lift block to VEX. Stop execution because either symbolic registers exist or symbolic values
+			// are read from memory
+			stop(STOP_VEX_LIFT_FAILED);
+			return;
+		}
+		// Add entry to taint relations cache
+		block_taint_cache.emplace(curr_block_details.block_addr, process_vex_block(lift_ret->irsb, curr_block_details.block_addr));
+	}
+	auto& block_taint_entry = block_taint_cache.at(curr_block_details.block_addr);
+	if (block_taint_entry.has_unsupported_stmt_or_expr_type) {
 		// There are symbolic registers and VEX statements in block for which taint propagation
 		// is not supported. Stop concrete execution.
 		stop(block_taint_entry.unsupported_stmt_stop_reason);
 		return;
 	}
-	// Resume propagating taints using symbolic_registers and symbolic_temps from where we paused
-	auto instr_taint_data_entries_it = block_taint_entry.block_instrs_taint_data_map.find(taint_engine_next_instr_address);
-	auto instr_taint_data_stop_it = block_taint_entry.block_instrs_taint_data_map.end();
-	// We continue propagating taint until we encounter 1) a memory read, 2) end of block or
-	// 3) a stop state for concrete execution
-	for (; instr_taint_data_entries_it != instr_taint_data_stop_it && !stopped; ++instr_taint_data_entries_it) {
-		address_t curr_instr_addr = instr_taint_data_entries_it->first;
-		auto& curr_instr_taint_entry = instr_taint_data_entries_it->second;
+	for (auto &instr: block_taint_entry.block_instrs_taint_data_map) {
+		address_t curr_instr_addr = instr.first;
+		auto& curr_instr_taint_entry = instr.second;
 		if (curr_instr_taint_entry.has_memory_read) {
-			// Pause taint propagation to process the memory read and continue from instruction
-			// after the memory read.
-			taint_engine_stop_mem_read_instruction = curr_instr_addr;
-			taint_engine_stop_mem_read_size = instr_taint_data_entries_it->second.mem_read_size;
-			taint_engine_next_instr_address = std::next(instr_taint_data_entries_it)->first;
-			return;
-		}
-		if ((symbolic_registers.size() == 0) && (block_symbolic_registers.size() == 0) && (block_symbolic_temps.size() == 0)) {
-			// There are no symbolic registers so no taint to propagate. Mark any memory writes
-			// as concrete and update slice of registers.
-			if (curr_instr_taint_entry.has_memory_write) {
-				mem_writes_taint_map.emplace(curr_instr_addr, false);
+			// Create mem_read_result entry from individual values. Sometimes, single memory read in VEX is split into
+			// multiple reads in unicorn
+			mem_read_result_t mem_read_result;
+			while (true) {
+				if (block_mem_reads_data.size() == 0) {
+					if (mem_read_result.read_size == 0) {
+						// This probably means that no read was performed in the entire block and so there is no need to
+						// propagate taint. This happens for instance in rep prefixed copies on X86.
+						// TODO: Is this a valid conclusion in all cases?
+						break;
+					}
+					assert(false && "Instruction expects more bytes in memory read but all bytes have been processed.");
+				}
+				auto& next_mem_read = block_mem_reads_data.front();
+				if (next_mem_read.recheck_taint_status) {
+					// A write may have modified the taint. Recheck taint.
+					next_mem_read.is_value_symbolic = (find_tainted(next_mem_read.address, next_mem_read.size) != -1);
+				}
+				mem_read_result.is_mem_read_symbolic |= next_mem_read.is_value_symbolic;
+				mem_read_result.memory_values.emplace_back(next_mem_read);
+				mem_read_result.read_size += next_mem_read.size;
+				block_mem_reads_data.erase(block_mem_reads_data.begin());
+				if (mem_read_result.read_size == curr_instr_taint_entry.mem_read_size) {
+					break;
+				}
+				else if (mem_read_result.read_size > curr_instr_taint_entry.mem_read_size) {
+					assert(false && "Somehow we have not read exact number of bytes but greater. This should not happen!");
+				}
 			}
-			compute_slice_of_instrs(curr_instr_addr, curr_instr_taint_entry);
-			update_register_slice(curr_instr_addr, curr_instr_taint_entry);
-			continue;
+			if (mem_read_result.read_size == 0) {
+				// No read was actually performed. No taint to propagate.
+				continue;
+			}
+			block_mem_reads_map.emplace(curr_instr_addr, mem_read_result);
 		}
 		compute_slice_of_instrs(curr_instr_addr, curr_instr_taint_entry);
 		propagate_taint_of_one_instr(curr_instr_addr, curr_instr_taint_entry);
 		update_register_slice(curr_instr_addr, curr_instr_taint_entry);
-	}
-	// If we reached here, execution has reached the end of the block
-	if (!stopped) {
-		if (curr_block_details.vex_lift_failed && ((symbolic_registers.size() > 0) || (block_symbolic_registers.size() > 0))) {
-			// There are symbolic registers but VEX lift failed so we can't determine
-			// status of guard condition
-			stop(STOP_VEX_LIFT_FAILED);
-			return;
-		}
-		else if (is_block_exit_guard_symbolic()) {
-			stop(STOP_SYMBOLIC_BLOCK_EXIT_CONDITION);
-		}
-		else if (is_block_next_target_symbolic()) {
-			stop(STOP_SYMBOLIC_BLOCK_EXIT_TARGET);
-		}
-	}
-	return;
-}
-
-void State::propagate_taint_of_mem_read_instr_and_continue(const address_t instr_addr) {
-	if (is_symbolic_tracking_disabled()) {
-		// We're not checking symbolic registers so no need to propagate taints
-		return;
-	}
-	auto mem_read_result = mem_reads_map.at(instr_addr);
-	if (curr_block_details.vex_lift_failed) {
-		if (mem_read_result.is_mem_read_symbolic || (symbolic_registers.size() > 0) || (block_symbolic_registers.size() > 0)) {
-			// Either the memory value is symbolic or there are symbolic registers: thus, taint
-			// status of registers could change. But since VEX lift failed, the taint relations
-			// are not known and so we can't propagate taint. Stop concrete execution.
-			stop(STOP_VEX_LIFT_FAILED);
-			return;
-		}
-		else {
-			// We cannot propagate taint since VEX lift failed and so we stop here. But, since
-			// there are no symbolic values, we do need need to propagate taint. Of course,
-			// the register slices cannot be updated but those won't be needed since this
-			// block will never be executed partially concretely and rest in VEX engine.
+		if (stopped) {
 			return;
 		}
 	}
-	if (mem_read_result.read_size != taint_engine_stop_mem_read_size) {
-		// There are more bytes to be read by this instruction. We do not propagate taint until bytes are read
-		// Sometimes reads are split across multiple reads hooks in unicorn.
-		return;
+	// If we reached here, execution has reached the end of the block. Check
+	if (is_block_exit_guard_symbolic()) {
+		stop(STOP_SYMBOLIC_BLOCK_EXIT_CONDITION);
 	}
-
-	// There are no more pending reads at this instruction. Now we can propagate taint.
-	// This allows us to also handle cases when only some of the memory reads are symbolic: we treat all as symbolic
-	// and overtaint.
-	auto& block_taint_entry = block_taint_cache.at(curr_block_details.block_addr);
-	auto& instr_taint_data_entry = block_taint_entry.block_instrs_taint_data_map.at(instr_addr);
-	if (mem_read_result.is_mem_read_symbolic || (symbolic_registers.size() > 0) || (block_symbolic_registers.size() > 0) ||
-	  block_symbolic_temps.size() > 0) {
-		if (block_taint_entry.has_unsupported_stmt_or_expr_type) {
-			// There are symbolic registers and/or memory read was symbolic and there are VEX
-			// statements in block for which taint propagation is not supported.
-			stop(block_taint_entry.unsupported_stmt_stop_reason);
-			return;
-		}
-		compute_slice_of_instrs(instr_addr, instr_taint_data_entry);
-		propagate_taint_of_one_instr(instr_addr, instr_taint_data_entry);
-	}
-	if (instr_slice_details_map.count(instr_addr) == 0) {
-		compute_slice_of_instrs(instr_addr, instr_taint_data_entry);
-	}
-	update_register_slice(instr_addr, instr_taint_data_entry);
-	if (!stopped) {
-		continue_propagating_taint();
+	else if (is_block_next_target_symbolic()) {
+		stop(STOP_SYMBOLIC_BLOCK_EXIT_TARGET);
 	}
 	return;
 }
@@ -1673,17 +1744,29 @@ void State::propagate_taint_of_one_instr(address_t instr_addr, const instruction
 				stop(STOP_SYMBOLIC_READ_ADDR);
 				return;
 			}
-			if (sink_taint_status == TAINT_STATUS_SYMBOLIC) {
-				// Save the memory location written to be marked as symbolic in write hook
-				// If memory write already exists, we overtaint and mark all writes as symbolic
-				mem_writes_taint_map[taint_sink.instr_addr] = true;
-				// Mark instruction as needing symbolic execution
-				is_instr_symbolic = true;
-			}
-			else {
-				// Save the memory location(s) written to be marked as concrete in the write
-				// hook only if it is not a previously seen write
-				mem_writes_taint_map.emplace(taint_sink.instr_addr, false);
+			int64_t curr_write_size = 0;
+			while (true) {
+				// Find all (address, size) pairs corresponding to the memory write and update their taint
+				if (block_mem_writes_data.size() == 0) {
+					assert(false && "Instruction expects more bytes to be written but all bytes have been processed.");
+				}
+				auto& mem_write_data = block_mem_writes_data.front();
+				curr_write_size += mem_write_data.second;
+				if (sink_taint_status == TAINT_STATUS_SYMBOLIC) {
+					propagate_write_taint(mem_write_data.first, mem_write_data.second, true, instr_addr);
+					// Mark instruction as needing symbolic execution
+					is_instr_symbolic = true;
+				}
+				else {
+					propagate_write_taint(mem_write_data.first, mem_write_data.second, false, instr_addr);
+				}
+				block_mem_writes_data.erase(block_mem_writes_data.begin());
+				if (curr_write_size == taint_sink.value_size) {
+					break;
+				}
+				else if (curr_write_size > taint_sink.value_size) {
+					assert(false && "Somehow we have not written exact number of bytes but greater. This should not happen!");
+				}
 			}
 		}
 		else if (taint_sink.entity_type != TAINT_ENTITY_NONE) {
@@ -1721,7 +1804,7 @@ void State::propagate_taint_of_one_instr(address_t instr_addr, const instruction
 		}
 	}
 	if (is_instr_symbolic) {
-		auto &instr_slice_details = instr_slice_details_map.at(instr_addr);
+		auto &instr_slice_details = block_instr_slice_details_map.at(instr_addr);
 		for (auto &reg: instr_slice_details.concrete_registers) {
 			auto reg_offset = reg.first;
 			auto reg_size = reg.second;
@@ -1741,7 +1824,7 @@ instr_details_t State::compute_instr_details(address_t instr_addr, const instruc
 	instr_details_t instr_details;
 	instr_details.instr_addr = instr_addr;
 	if (instr_taint_entry.has_memory_read) {
-		auto mem_read_result = mem_reads_map.at(instr_addr);
+		auto mem_read_result = block_mem_reads_map.at(instr_addr);
 		if (!mem_read_result.is_mem_read_symbolic) {
 			instr_details.has_concrete_memory_dep = true;
 			instr_details.has_symbolic_memory_dep = false;
@@ -1764,57 +1847,10 @@ void State::read_memory_value(address_t address, uint64_t size, uint8_t *result,
 	return;
 }
 
-void State::start_propagating_taint(address_t block_address, int32_t block_size) {
+void State::setup_initial_state(address_t block_address, int32_t block_size) {
 	curr_block_details.block_addr = block_address;
 	curr_block_details.block_size = block_size;
-	if (is_symbolic_tracking_disabled()) {
-		// We're not checking symbolic registers so no need to propagate taints
-		return;
-	}
-	if (this->block_taint_cache.find(block_address) == this->block_taint_cache.end()) {
-		// Compute and cache taint sink-source relations for this block
-		// Disable cross instruction optimization in IR so that dependencies of symbolic
-		// instructions can be computed correctly.
-		VexRegisterUpdates pxControl = VexRegUpdUnwindregsAtMemAccess;
-		std::unique_ptr<uint8_t[]> instructions(new uint8_t[block_size]);
-		address_t lift_address;
-
-		if ((arch == UC_ARCH_ARM) && is_thumb_mode()) {
-			lift_address = block_address | 1;
-		}
-		else {
-			lift_address = block_address;
-		}
-		uc_mem_read(this->uc, lift_address, instructions.get(), block_size);
-		VEXLiftResult *lift_ret = vex_lift(
-			this->vex_guest, this->vex_archinfo, instructions.get(), lift_address, 99, block_size, 1, 0, 1,
-			1, 0, pxControl
-		);
-
-		if ((lift_ret == NULL) || (lift_ret->size == 0)) {
-			// Failed to lift block to VEX.
-			if (symbolic_registers.size() > 0) {
-				// There are symbolic registers but VEX lift failed so we can't propagate taint
-				stop(STOP_VEX_LIFT_FAILED);
-			}
-			else {
-				// There are no symbolic registers so attempt to execute block. Mark block as VEX lift failed.
-				curr_block_details.vex_lift_failed = true;
-			}
-			return;
-		}
-		if ((arch == UC_ARCH_ARM) && (lift_ret->irsb->jumpkind == Ijk_Sys_syscall)) {
-			// This block invokes a syscall. For now, such blocks are handled by VEX engine.
-			stop(STOP_SYSCALL_ARM);
-			return;
-		}
-		auto block_taint_entry = process_vex_block(lift_ret->irsb, block_address);
-		// Add entry to taint relations cache
-		block_taint_cache.emplace(block_address, block_taint_entry);
-	}
-	taint_engine_next_instr_address = block_address;
-	block_symbolic_temps.clear();
-	block_start_reg_values.clear();
+	one_block_executed = true;
 	for (auto &reg_instr_slice_entry: reg_instr_slice) {
 		// Clear slice for register
 		reg_instr_slice_entry.second.clear();
@@ -1834,26 +1870,6 @@ void State::start_propagating_taint(address_t block_address, int32_t block_size)
 		get_register_value(cpu_flag.first, flag_value.value);
 		block_start_reg_values.emplace(flag_value.offset, flag_value);
 	}
-	propagate_taints();
-	return;
-}
-
-void State::continue_propagating_taint() {
-	if (is_symbolic_tracking_disabled()) {
-		// We're not checking symbolic registers so no need to propagate taints
-		return;
-	}
-	if (curr_block_details.vex_lift_failed) {
-		if ((symbolic_registers.size() > 0) || (block_symbolic_registers.size() > 0)) {
-			// There are symbolic registers but VEX lift failed so we can't propagate taint
-			stop(STOP_VEX_LIFT_FAILED);
-			return;
-		}
-	}
-	else {
-		propagate_taints();
-	}
-	return;
 }
 
 std::vector<std::pair<address_t, uint64_t>> State::find_symbolic_mem_deps(const instr_details_t &instr) const {
@@ -1863,7 +1879,7 @@ std::vector<std::pair<address_t, uint64_t>> State::find_symbolic_mem_deps(const 
 		symbolic_mem_deps.insert(symbolic_mem_deps.end(), result.begin(), result.end());
 	}
 	if (instr.has_symbolic_memory_dep) {
-		for (auto &mem_value: mem_reads_map.at(instr.instr_addr).memory_values) {
+		for (auto &mem_value: block_mem_reads_map.at(instr.instr_addr).memory_values) {
 			if (mem_value.is_value_symbolic) {
 				symbolic_mem_deps.emplace_back(std::make_pair(mem_value.address, mem_value.size));
 			}
@@ -1874,7 +1890,7 @@ std::vector<std::pair<address_t, uint64_t>> State::find_symbolic_mem_deps(const 
 
 void State::save_concrete_memory_deps(instr_details_t &instr) {
 	if (instr.has_concrete_memory_dep) {
-		archived_memory_values.emplace_back(mem_reads_map.at(instr.instr_addr).memory_values);
+		archived_memory_values.emplace_back(block_mem_reads_map.at(instr.instr_addr).memory_values);
 		instr.memory_values = &(archived_memory_values.back()[0]);
 		instr.memory_values_count = archived_memory_values.back().size();
 	}
@@ -1885,7 +1901,7 @@ void State::save_concrete_memory_deps(instr_details_t &instr) {
 	while (!instrs_to_process.empty()) {
 		auto &curr_instr = instrs_to_process.front();
 		if (curr_instr->has_concrete_memory_dep) {
-			archived_memory_values.emplace_back(mem_reads_map.at(curr_instr->instr_addr).memory_values);
+			archived_memory_values.emplace_back(block_mem_reads_map.at(curr_instr->instr_addr).memory_values);
 			curr_instr->memory_values = &(archived_memory_values.back()[0]);
 			curr_instr->memory_values_count = archived_memory_values.back().size();
 		}
@@ -1981,56 +1997,7 @@ static void hook_mem_read(uc_engine *uc, uc_mem_type type, uint64_t address, int
 	// //LOG_D("mem_read [%#lx, %#lx] = %#lx", address, address + size);
 	//LOG_D("mem_read [%#lx, %#lx]", address, address + size);
 	State *state = (State *)user_data;
-	memory_value_t memory_read_value;
-	bool is_memory_value_symbolic;
-	address_t curr_instr_addr;
-
-	memory_read_value.reset();
-	memory_read_value.address = address;
-	memory_read_value.size = size;
-	if (!state->is_symbolic_taint_propagation_disabled()) {
-		// unicorn-engine doesn't update PC register in some cases and so it has incorrect value for current instruction
-		// address. XMM reads sometimes trigger the hook multiple times and there could be multiple reads in one instruction
-		// in some archs. So, we use the taint engine to determine instruction address correctly.
-		// See https://github.com/unicorn-engine/unicorn/issues/1312, https://github.com/unicorn-engine/unicorn/pull/1257
-		curr_instr_addr = state->get_taint_engine_stop_mem_read_instr_addr();
-	}
-	else {
-		// Symbolic taint propagation is disabled so we get current instruction address from unicorn
-		curr_instr_addr = state->get_instruction_pointer();
-	}
-	auto tainted = state->find_tainted(address, size);
-	if (tainted != -1)
-	{
-		if (state->is_symbolic_tracking_disabled()) {
-			// Symbolic register tracking is disabled but memory location has symbolic data.
-			// We switch to VEX engine then.
-			state->stop(STOP_SYMBOLIC_READ_SYMBOLIC_TRACKING_DISABLED);
-			return;
-		}
-		is_memory_value_symbolic = true;
-	}
-	else
-	{
-		is_memory_value_symbolic = false;
-		state->read_memory_value(address, size, memory_read_value.value, MAX_MEM_ACCESS_SIZE);
-	}
-	memory_read_value.is_value_symbolic = is_memory_value_symbolic;
-	auto mem_reads_map_entry = state->mem_reads_map.find(curr_instr_addr);
-	if (mem_reads_map_entry == state->mem_reads_map.end()) {
-		mem_read_result_t mem_read_result;
-		mem_read_result.memory_values.emplace_back(memory_read_value);
-		mem_read_result.is_mem_read_symbolic = is_memory_value_symbolic;
-		mem_read_result.read_size = size;
-		state->mem_reads_map.emplace(curr_instr_addr, mem_read_result);
-	}
-	else {
-		auto &mem_read_entry = state->mem_reads_map.at(curr_instr_addr);
-		mem_read_entry.memory_values.emplace_back(memory_read_value);
-		mem_read_entry.is_mem_read_symbolic |= is_memory_value_symbolic;
-		mem_read_entry.read_size += size;
-	}
-	state->propagate_taint_of_mem_read_instr_and_continue(curr_instr_addr);
+	state->handle_read_hook(address, size);
 	return;
 }
 
@@ -2057,7 +2024,7 @@ static void hook_mem_write(uc_engine *uc, uc_mem_type type, uint64_t address, in
 		state->ignore_next_block = true;
 	}
 
-	state->handle_write(address, size, false);
+	state->handle_write_hook(address, size);
 }
 
 static void hook_block(uc_engine *uc, uint64_t address, int32_t size, void *user_data) {
@@ -2069,17 +2036,22 @@ static void hook_block(uc_engine *uc, uint64_t address, int32_t size, void *user
 		state->ignore_next_selfmod = true;
 		return;
 	}
-	if (!state->check_symbolic_stack_mem_dependencies_liveness()) {
-		state->stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
-		return;
+	// Check if at least one block has been executed in unicorn
+	if (state->executed_one_block()) {
+		// Propagate taint for the previous block executed in unicorn
+		state->propagate_taints();
+		if (state->stopped) {
+			return;
+		}
+		if (!state->check_symbolic_stack_mem_dependencies_liveness()) {
+			state->stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
+			return;
+		}
 	}
 	state->commit();
 	state->update_previous_stack_top();
 	state->step(address, size);
-
-	if (!state->stopped) {
-		state->start_propagating_taint(address, size);
-	}
+	state->setup_initial_state(address, size);
 	return;
 }
 
@@ -2148,7 +2120,11 @@ static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data) {
 				}
 
 				uc_err err = uc_mem_write(uc, tx_bytes, &count, 4);
-				if (tx_bytes != 0) state->handle_write(tx_bytes, 4, true);
+				if (tx_bytes != 0) {
+					state->save_memory_record(tx_bytes, 4);
+					// Write is concrete so instruction address doesn't matter
+					state->propagate_write_taint(tx_bytes, 4, false, 0);
+				}
 				if (state->stopped) {
 					return;
 				}
@@ -2240,6 +2216,10 @@ uc_err simunicorn_start(State *state, uint64_t pc, uint64_t step) {
 
 extern "C"
 void simunicorn_stop(State *state, stop_t reason) {
+	if (reason == STOP_SYSCALL) {
+		// Propagate taints for the last block executed before stopping
+		state->propagate_taints();
+	}
 	state->stop(reason);
 }
 

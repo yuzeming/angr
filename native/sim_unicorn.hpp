@@ -117,6 +117,7 @@ struct memory_value_t {
     uint8_t value[MAX_MEM_ACCESS_SIZE];
     uint64_t size;
 	bool is_value_symbolic;
+	bool recheck_taint_status;
 
 	bool operator==(const memory_value_t &other_mem_value) const {
 		if ((address != other_mem_value.address) || (size != other_mem_value.size) ||
@@ -130,6 +131,7 @@ struct memory_value_t {
 		address = 0;
 		size = 0;
 		memset(value, 0, MAX_MEM_ACCESS_SIZE);
+		recheck_taint_status = false;
 	}
 };
 
@@ -137,6 +139,12 @@ struct mem_read_result_t {
 	std::vector<memory_value_t> memory_values;
 	bool is_mem_read_symbolic;
 	uint32_t read_size;
+
+	mem_read_result_t() {
+		memory_values.clear();
+		is_mem_read_symbolic = false;
+		read_size = 0;
+	}
 };
 
 struct register_value_t {
@@ -203,13 +211,18 @@ struct instr_details_t {
 struct block_details_t {
 	address_t block_addr;
 	uint64_t block_size;
+	// Status field indicating if block reads symbolic value from memory
+	bool has_symbolic_mem_read;
 	std::vector<instr_details_t> symbolic_instrs;
+	bool vex_lift_done;
 	bool vex_lift_failed;
 
 	void reset() {
 		block_addr = 0;
 		block_size = 0;
+		has_symbolic_mem_read = false;
 		symbolic_instrs.clear();
+		vex_lift_done = false;
 		vex_lift_failed = false;
 	}
 };
@@ -462,7 +475,7 @@ class State {
 
 	// Slice of current block for an instruction
 
-	std::unordered_map<address_t, instr_slice_details_t> instr_slice_details_map;
+	std::unordered_map<address_t, instr_slice_details_t> block_instr_slice_details_map;
 	// List of instructions in a block that should be executed symbolically. These are stored
 	// separately for easy rollback in case of errors.
 	block_details_t curr_block_details;
@@ -484,9 +497,6 @@ class State {
 	//std::map<uint64_t, taint_t *> active_pages;
 	std::set<uint64_t> stop_points;
 
-	address_t taint_engine_next_instr_address, taint_engine_stop_mem_read_instruction;
-	uint32_t taint_engine_stop_mem_read_size;
-
 	address_t unicorn_next_instr_addr;
 	address_t prev_stack_top_addr;
 
@@ -496,6 +506,9 @@ class State {
 
 	// Pointer to memory writes' data passed to Python land
 	mem_update_t *mem_updates_head;
+
+	// Status field indicating whether at least one block as been emulated in unicorn
+	bool one_block_executed;
 
 	// Private functions
 
@@ -526,13 +539,14 @@ class State {
 	bool is_symbolic_register(vex_reg_offset_t reg_offset, int64_t reg_size) const;
 	bool is_symbolic_temp(vex_tmp_id_t temp_id) const;
 
+	VEXLiftResult* lift_block(address_t block_address, int32_t block_size);
+
 	void mark_register_symbolic(vex_reg_offset_t reg_offset, int64_t reg_size);
 	void mark_register_concrete(vex_reg_offset_t reg_offset, int64_t reg_size);
 	void mark_temp_symbolic(vex_tmp_id_t temp_id);
 
 	block_taint_entry_t process_vex_block(IRSB *vex_block, address_t address);
 
-	void propagate_taints();
 	void propagate_taint_of_one_instr(address_t instr_addr, const instruction_taint_entry_t &instr_taint_entry);
 
 	// Save values of concrete memory reads performed by an instruction and it's dependencies
@@ -636,8 +650,17 @@ class State {
 		int64_t cpu_flags_register;
 		stop_details_t stop_details;
 
+		// List of all values read from memory in current block
+		std::vector<memory_value_t> block_mem_reads_data;
+
 		// Result of all memory reads executed. Instruction address -> memory read result
-		std::unordered_map<address_t, mem_read_result_t> mem_reads_map;
+		std::unordered_map<address_t, mem_read_result_t> block_mem_reads_map;
+
+		// Addresses written to by block and whether the write is definitely concrete
+		std::unordered_map<address_t, bool> block_mem_writes_addrs;
+
+		// List of addresses and size of memory writes in current block
+		std::vector<std::pair<address_t, int>> block_mem_writes_data;
 
 		// List of instructions that should be executed symbolically; used to store data to return
 		std::vector<sym_block_details_t> block_details_to_return;
@@ -688,6 +711,11 @@ class State {
 		void rollback();
 
 		/*
+		 * save memory record.
+		 */
+		void save_memory_record(address_t address, int size);
+
+		/*
 		 * allocate a new PageBitmap and put into active_pages.
 		 */
 		void page_activate(address_t address, uint8_t *taint, uint8_t *data);
@@ -718,15 +746,17 @@ class State {
 		// Returns -1 if no tainted data is present.
 		int64_t find_tainted(address_t address, int size);
 
-		void handle_write(address_t address, int size, bool is_interrupt);
+		void handle_read_hook(address_t address, int size);
 
-		void propagate_taint_of_mem_read_instr_and_continue(const address_t instr_addr);
+		void handle_write_hook(address_t address, int size);
+
+		void propagate_write_taint(address_t address, int size, bool is_dst_symbolic, address_t instr_addr);
 
 		void read_memory_value(address_t address, uint64_t size, uint8_t *result, size_t result_size) const;
 
-		void start_propagating_taint(address_t block_address, int32_t block_size);
+		void propagate_taints();
 
-		void continue_propagating_taint();
+		void setup_initial_state(address_t address, int32_t size);
 
 		bool check_symbolic_stack_mem_dependencies_liveness() const;
 
@@ -735,6 +765,10 @@ class State {
 		address_t get_stack_pointer() const;
 
 		// Inline functions
+
+		inline bool executed_one_block() const {
+			return one_block_executed;
+		}
 
 		/*
 		* Feasibility checks for unicorn
@@ -746,10 +780,6 @@ class State {
 
 		inline bool is_symbolic_taint_propagation_disabled() const {
 			return (is_symbolic_tracking_disabled() || curr_block_details.vex_lift_failed);
-		}
-
-		inline address_t get_taint_engine_stop_mem_read_instr_addr() const {
-			return taint_engine_stop_mem_read_instruction;
 		}
 
 		inline void update_previous_stack_top() {
