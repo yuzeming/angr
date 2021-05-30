@@ -1760,6 +1760,9 @@ void State::propagate_taint_of_one_instr(address_t instr_addr, const instruction
 				else {
 					propagate_write_taint(mem_write_data.first, mem_write_data.second, false, instr_addr);
 				}
+				if (stopped) {
+					return;
+				}
 				block_mem_writes_data.erase(block_mem_writes_data.begin());
 				if (curr_write_size == taint_sink.value_size) {
 					break;
