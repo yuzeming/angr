@@ -140,6 +140,12 @@ uc_err State::start(address_t pc, uint64_t step) {
 }
 
 void State::stop(stop_t reason, bool do_commit) {
+	if (stopped) {
+		// Check if execution is still running. Sometimes, a stop is requested for same block twice because taint is
+		// propagated after the block is executed in unicorn. Eg: a symbolic stop in middle of block followed by a
+		// syscall stop at end of the block.
+		return;
+	}
 	stopped = true;
 	stop_details.stop_reason = reason;
 	stop_details.block_addr = curr_block_details.block_addr;
@@ -1613,8 +1619,9 @@ bool State::is_symbolic_temp(vex_tmp_id_t temp_id) const {
 }
 
 void State::propagate_taints() {
-	if (is_symbolic_tracking_disabled()) {
-		// We're not checking symbolic registers so no need to propagate taints
+	if (stopped || is_symbolic_tracking_disabled()) {
+		// We're not checking symbolic registers so no need to propagate taints. Also, ensure execution is still active
+		// before propagating taints.
 		return;
 	}
 	VEXLiftResult *lift_ret;
