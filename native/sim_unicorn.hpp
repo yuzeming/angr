@@ -639,6 +639,7 @@ class State {
 		bool interrupt_handled;
 		uint32_t transmit_sysno;
 		uint32_t transmit_bbl_addr;
+		bool cgc_transmit_in_previous_block;
 
 		VexArch vex_guest;
 		VexArchInfo vex_archinfo;

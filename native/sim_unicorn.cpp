@@ -52,6 +52,7 @@ State::State(uc_engine *_uc, uint64_t cache_key):uc(_uc) {
 	mode = *((uc_mode*)((uc_arch*)uc + 1));
 	curr_block_details.reset();
 	one_block_executed = false;
+	cgc_transmit_in_previous_block = false;
 }
 
 /*
@@ -1725,6 +1726,9 @@ void State::propagate_taints() {
 	else if (is_block_next_target_symbolic()) {
 		stop(STOP_SYMBOLIC_BLOCK_EXIT_TARGET);
 	}
+	if (!check_symbolic_stack_mem_dependencies_liveness()) {
+		stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
+	}
 	return;
 }
 
@@ -1881,6 +1885,7 @@ void State::setup_initial_state(address_t block_address, int32_t block_size) {
 		get_register_value(cpu_flag.first, flag_value.value);
 		block_start_reg_values.emplace(flag_value.offset, flag_value);
 	}
+	cgc_transmit_in_previous_block = false;
 }
 
 std::vector<std::pair<address_t, uint64_t>> State::find_symbolic_mem_deps(const instr_details_t &instr) const {
@@ -2047,20 +2052,18 @@ static void hook_block(uc_engine *uc, uint64_t address, int32_t size, void *user
 		state->ignore_next_selfmod = true;
 		return;
 	}
-	// Check if at least one block has been executed in unicorn
-	if (state->executed_one_block()) {
-		// Propagate taint for the previous block executed in unicorn
-		state->propagate_taints();
-		if (state->stopped) {
-			return;
+	if (!state->cgc_transmit_in_previous_block) {
+		// Check if at least one block has been executed in unicorn
+		if (state->executed_one_block()) {
+			// Propagate taint for the previous block executed in unicorn
+			state->propagate_taints();
+			if (state->stopped) {
+				return;
+			}
 		}
-		if (!state->check_symbolic_stack_mem_dependencies_liveness()) {
-			state->stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
-			return;
-		}
+		state->commit();
+		state->update_previous_stack_top();
 	}
-	state->commit();
-	state->update_previous_stack_top();
 	state->step(address, size);
 	state->setup_initial_state(address, size);
 	return;
@@ -2121,6 +2124,10 @@ static void hook_intr(uc_engine *uc, uint32_t intno, void *user_data) {
 					return;
 				}
 
+				// Propagate taints for the block before performing transmit syscall at it's end
+				state->propagate_taints();
+				state->cgc_transmit_in_previous_block = true;
+				state->commit();
 				state->step(state->transmit_bbl_addr, 0, false);
 				state->commit();
 				if (state->stopped)
