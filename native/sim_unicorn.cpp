@@ -1726,9 +1726,6 @@ void State::propagate_taints() {
 	else if (is_block_next_target_symbolic()) {
 		stop(STOP_SYMBOLIC_BLOCK_EXIT_TARGET);
 	}
-	if (!check_symbolic_stack_mem_dependencies_liveness()) {
-		stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
-	}
 	return;
 }
 
@@ -2058,6 +2055,10 @@ static void hook_block(uc_engine *uc, uint64_t address, int32_t size, void *user
 			// Propagate taint for the previous block executed in unicorn
 			state->propagate_taints();
 			if (state->stopped) {
+				return;
+			}
+			if (!state->check_symbolic_stack_mem_dependencies_liveness()) {
+				state->stop(STOP_SYMBOLIC_MEM_DEP_NOT_LIVE, true);
 				return;
 			}
 		}
