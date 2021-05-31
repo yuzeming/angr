@@ -1705,8 +1705,9 @@ void State::propagate_taints() {
 				}
 			}
 			if (mem_read_result.read_size == 0) {
-				// No read was actually performed. No taint to propagate.
-				continue;
+				// No read was actually performed. That also means instructions after the read(if any) were also likely
+				// not executed. We can stop taint propagation here.
+				break;
 			}
 			block_mem_reads_map.emplace(curr_instr_addr, mem_read_result);
 		}
