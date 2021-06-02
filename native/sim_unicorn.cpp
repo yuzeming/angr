@@ -674,16 +674,6 @@ void State::propagate_write_taint(address_t address, int size, bool is_dst_symbo
 	}
 
 	clean = 0;
-	if (is_dst_symbolic) {
-		// Save the details of memory location written to in the instruction details
-		for (auto &symbolic_instr: curr_block_details.symbolic_instrs) {
-			if (symbolic_instr.instr_addr == instr_addr) {
-				symbolic_instr.mem_write_addr = address;
-				symbolic_instr.mem_write_size = size;
-				break;
-			}
-		}
-	}
 	if ((find_tainted(address, size) != -1) & (!is_dst_symbolic)) {
 		// We are writing to a memory location that is currently symbolic. If the destination if a memory dependency
 		// of some instruction to be re-executed, we need to re-execute that instruction before continuing.
@@ -1765,6 +1755,9 @@ void State::propagate_taint_of_one_instr(address_t instr_addr, const instruction
 					propagate_write_taint(mem_write_data.first, mem_write_data.second, true, instr_addr);
 					// Mark instruction as needing symbolic execution
 					is_instr_symbolic = true;
+					// Save the details of memory location written to in the instruction details
+					instr_details.mem_write_addr = mem_write_data.first;
+					instr_details.mem_write_size = mem_write_data.second;
 				}
 				else {
 					propagate_write_taint(mem_write_data.first, mem_write_data.second, false, instr_addr);
