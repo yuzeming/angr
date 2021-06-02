@@ -1504,17 +1504,30 @@ int32_t State::get_vex_expr_result_size(IRExpr *expr, IRTypeEnv* tyenv) const {
 VEXLiftResult* State::lift_block(address_t block_address, int32_t block_size) {
 	VexRegisterUpdates pxControl = VexRegUpdUnwindregsAtMemAccess;
 	std::unique_ptr<uint8_t[]> instructions(new uint8_t[block_size]);
-	address_t lift_address;
 
-	if ((arch == UC_ARCH_ARM) && is_thumb_mode()) {
-		lift_address = block_address | 1;
-	}
-	else {
-		lift_address = block_address;
-	}
-	uc_mem_read(uc, lift_address, instructions.get(), block_size);
 	curr_block_details.vex_lift_done = true;
-	return vex_lift(vex_guest, vex_archinfo, instructions.get(), lift_address, 99, block_size, 1, 0, 1, 1, 0, pxControl);
+	if (arch == UC_ARCH_ARM) {
+		// ARM lifting is handled separately for now: attempt to lift from offset 0 and 1. For some blocks, offset 0
+		// works while others offset 1 works. ARM/Thumb mode does not seem to matter.
+		// TODO: Fix this so that we don't have to attempt lifting twice.
+		VEXLiftResult *ret_val;
+		address_t lift_address;
+		if (is_thumb_mode()) {
+			lift_address = block_address | 1;
+		}
+		else {
+			lift_address = block_address;
+		}
+		uc_mem_read(uc, lift_address, instructions.get(), block_size);
+		ret_val = vex_lift(vex_guest, vex_archinfo, instructions.get(), lift_address, 99, block_size, 1, 0, 1, 1, 0, pxControl);
+		if ((ret_val != NULL) && (ret_val->size == 0)) {
+			// Lift failed. Let's try lifting again with instruction bytes starting from offset 1
+			ret_val = vex_lift(vex_guest, vex_archinfo, instructions.get() + 1, lift_address, 99, block_size, 1, 0, 1, 1, 0, pxControl);
+		}
+		return ret_val;
+	}
+	uc_mem_read(uc, block_address, instructions.get(), block_size);
+	return vex_lift(vex_guest, vex_archinfo, instructions.get(), block_address, 99, block_size, 1, 0, 1, 1, 0, pxControl);
 }
 
 void State::mark_register_symbolic(vex_reg_offset_t reg_offset, int64_t reg_size) {
