@@ -399,7 +399,11 @@ class SimEnginePropagatorAIL(
             return PropValue.from_value_and_details(new_value, expr.size, expr, self._codeloc())
 
     def _ail_handle_Const(self, expr: Expr.Const) -> PropValue:
-        return PropValue.from_value_and_details(claripy.BVV(expr.value, expr.bits), expr.size, expr, self._codeloc())
+        if isinstance(expr.value, float):
+            v = claripy.FPV(expr.value, claripy.FSORT_DOUBLE if expr.bits == 64 else claripy.FSORT_FLOAT)
+        else:
+            v = claripy.BVV(expr.value, expr.bits)
+        return PropValue.from_value_and_details(v, expr.size, expr, self._codeloc())
 
     def _ail_handle_DirtyExpression(self, expr: Expr.DirtyExpression) -> Optional[PropValue]:  # pylint:disable=no-self-use
 
@@ -467,6 +471,20 @@ class SimEnginePropagatorAIL(
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
+    def _ail_handle_Neg(self, expr):
+        o_value = self._expr(expr.operand)
+
+        value = self.state.top(expr.bits)
+        if o_value is None:
+            new_expr = expr
+        else:
+            o_expr = o_value.one_expr
+            new_expr = Expr.UnaryOp(expr.idx,
+                                    'Neg',
+                                     o_expr if o_expr is not None else expr.operands[0],
+                                     **expr.tags)
+        return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
+
     def _ail_handle_Cmp(self, expr: Expr.BinaryOp) -> PropValue:
         operand_0_value = self._expr(expr.operands[0])
         operand_1_value = self._expr(expr.operands[1])
@@ -526,6 +544,8 @@ class SimEnginePropagatorAIL(
                                          [o0_expr if o0_expr is not None else expr.operands[0],
                                           o1_expr if o1_expr is not None else expr.operands[1],],
                                          expr.signed,
+                                         floating_point=expr.floating_point,
+                                         rounding_mode=expr.rounding_mode,
                                          **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -553,6 +573,8 @@ class SimEnginePropagatorAIL(
                                          [o0_expr if o0_expr is not None else expr.operands[0],
                                           o1_expr if o1_expr is not None else expr.operands[1],],
                                          expr.signed,
+                                         floating_point=expr.floating_point,
+                                         rounding_mode=expr.rounding_mode,
                                          **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -583,6 +605,8 @@ class SimEnginePropagatorAIL(
                                          [o0_expr if o0_expr is not None else expr.operands[0],
                                           o1_expr if o1_expr is not None else expr.operands[1],],
                                          expr.signed,
+                                         floating_point=expr.floating_point,
+                                         rounding_mode=expr.rounding_mode,
                                          **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -601,6 +625,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -619,6 +645,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -637,6 +665,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1], ],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -655,6 +685,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -673,6 +705,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -691,6 +725,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -709,6 +745,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -727,6 +765,8 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
 
@@ -745,8 +785,33 @@ class SimEnginePropagatorAIL(
                                      [o0_expr if o0_expr is not None else expr.operands[0],
                                       o1_expr if o1_expr is not None else expr.operands[1],],
                                      expr.signed,
+                                     floating_point=expr.floating_point,
+                                     rounding_mode=expr.rounding_mode,
                                      **expr.tags)
         return PropValue.from_value_and_details(value, expr.size, new_expr, self._codeloc())
+
+    def _ail_handle_TernaryOp(self, expr: Expr.TernaryOp):
+        o0_value = self._expr(expr.operands[0])
+        o1_value = self._expr(expr.operands[1])
+        o2_value = self._expr(expr.operands[2])
+
+        if o0_value is None or o1_value is None or o2_value is None:
+            new_expr = expr
+        else:
+            o0_expr = o0_value.one_expr
+            o1_expr = o1_value.one_expr
+            o2_expr = o2_value.one_expr
+            new_expr = Expr.TernaryOp(
+                expr.idx,
+                expr.op,
+                [o0_expr if o0_expr is not None else expr.operands[0],
+                 o1_expr if o1_expr is not None else expr.operands[1],
+                 o2_expr if o2_expr is not None else expr.operands[2]],
+                bits=expr.bits,
+                **expr.tags
+            )
+
+        return PropValue.from_value_and_details(self.state.top(expr.bits), expr.size, new_expr, self._codeloc())
 
     def _ail_handle_Concat(self, expr):
         o0_value = self._expr(expr.operands[0])

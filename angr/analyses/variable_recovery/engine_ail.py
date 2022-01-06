@@ -187,7 +187,10 @@ class SimEngineVRAIL(
         return self._load(addr_r, size, expr=expr)
 
     def _ail_handle_Const(self, expr):
-        v = claripy.BVV(expr.value, expr.size * self.state.arch.byte_width)
+        if isinstance(expr.value, float):
+            v = claripy.FPV(expr.value, claripy.FSORT_DOUBLE if expr.bits == 64 else claripy.FSORT_FLOAT)
+        else:
+            v = claripy.BVV(expr.value, expr.size * self.state.arch.byte_width)
         r = RichR(v, typevar=typeconsts.int_type(expr.size * self.state.arch.byte_width))
         self._reference(r, self._codeloc())
         return r
@@ -567,12 +570,27 @@ class SimEngineVRAIL(
         arg = expr.operands[0]
         expr = self._expr(arg)
 
-
         result_size = arg.bits
 
         if expr.data.concrete:
             return RichR(
                 ~expr.data,
+                typevar=typeconsts.int_type(result_size),
+                type_constraints=None,
+            )
+
+        r = self.state.top(result_size)
+        return RichR(r, typevar=expr.typevar)
+
+    def _ail_handle_Neg(self, expr):
+        arg = expr.operands[0]
+        expr = self._expr(arg)
+
+        result_size = arg.bits
+
+        if expr.data.concrete:
+            return RichR(
+                -expr.data,
                 typevar=typeconsts.int_type(result_size),
                 type_constraints=None,
             )
