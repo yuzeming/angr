@@ -1,4 +1,7 @@
 from typing import Optional, Tuple, Any
+from collections import defaultdict
+
+import networkx
 
 import networkx
 
@@ -234,7 +237,6 @@ def to_ail_supergraph(transition_graph: networkx.DiGraph) -> networkx.DiGraph:
     """
     Takes an AIL graph and converts it into a AIL graph that treats calls and redundant jumps
     as parts of a bigger block instead of transitions. Calls to returning functions do not terminate basic blocks.
-
     Based on region_identifier super_graph
 
     :return: A converted super transition graph
