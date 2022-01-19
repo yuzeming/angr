@@ -244,19 +244,81 @@ def to_ail_supergraph(transition_graph: networkx.DiGraph) -> networkx.DiGraph:
     # make a copy of the graph
     transition_graph = networkx.DiGraph(transition_graph)
 
-    while True:
-        for src, dst, data in transition_graph.edges(data=True):
-            type_ = data.get('type', None)
+    # remove all edges that transitions to outside
+    for src, dst, data in list(transition_graph.edges(data=True)):
+        if data['type'] in ('transition', 'exception') and data.get('outside', False) is True:
+            transition_graph.remove_edge(src, dst)
+        # remove dead nodes
+        if transition_graph.in_degree(dst) == 0:
+            transition_graph.remove_node(dst)
 
-            if len(list(transition_graph.successors(src))) == 1 and len(list(transition_graph.predecessors(dst))) == 1:
-                # calls in the middle of blocks OR boring jumps
-                if (type_ == 'fake_return') or (src.addr + src.original_size == dst.addr):
-                    _merge_ail_nodes(transition_graph, src, dst)
-                    break
+    edges_to_shrink = set()
 
-            # calls to functions with no return
-            elif type_ == 'call':
-                transition_graph.remove_node(dst)
+    # Find all edges to remove in the super graph
+    for src in transition_graph.nodes():
+        edges = transition_graph[src]
+
+        # there are two types of edges we want to remove:
+        # - call or fakerets, since we do not want blocks to break at calls
+        # - boring jumps that directly transfer the control to the block immediately after the current block.
+
+        if len(edges) == 1 and src.addr + src.original_size == next(iter(edges.keys())).addr:
+            dst = next(iter(edges.keys()))
+            dst_in_edges = transition_graph.in_edges(dst)
+            if len(dst_in_edges) == 1:
+                edges_to_shrink.add((src, dst))
+                continue
+
+        # skip anything that is not like a call
+        if any(iter('type' in data and data['type'] not in ('fake_return', 'call') for data in edges.values())):
+            continue
+
+        for dst, data in edges.items():
+            if 'type' in data and data['type'] == 'fake_return':
+                if all(iter('type' in data and data['type'] in ('fake_return', 'return_from_call')
+                            for _, _, data in transition_graph.in_edges(dst, data=True))):
+                    edges_to_shrink.add((src, dst))
+                break
+
+    # Create the super graph
+    super_graph = networkx.DiGraph()
+    supernodes_map = {}
+
+    for node in transition_graph.nodes():
+        dests_and_data = transition_graph[node]
+
+        # make a super node
+        if node in supernodes_map:
+            src_supernode = supernodes_map[node]
+        else:
+            src_supernode = SuperAILNode.from_ailnode(node)
+            supernodes_map[node] = src_supernode
+            # insert it into the graph
+            super_graph.add_node(src_supernode)
+
+        if not dests_and_data:
+            # might be an isolated node
+            continue
+
+        # Take src_supernode off the graph since we might modify it
+        if src_supernode in super_graph:
+            existing_in_edges = list(super_graph.in_edges(src_supernode, data=True))
+            existing_out_edges = list(super_graph.out_edges(src_supernode, data=True))
+            super_graph.remove_node(src_supernode)
+        else:
+            existing_in_edges = [ ]
+            existing_out_edges = [ ]
+
+        for dst, data in dests_and_data.items():
+            edge = (node, dst)
+
+            if edge in edges_to_shrink:
+                dst_supernode = supernodes_map.get(dst, None)
+                src_supernode.insert_ailnode(dst)
+
+                # update supernodes map
+                supernodes_map[dst] = src_supernode
+
                 break
         else:
             break
