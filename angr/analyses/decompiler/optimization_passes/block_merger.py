@@ -1,6 +1,8 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 import logging
+import copy
 
+import networkx
 import networkx as nx
 
 from ailment.block import Block
@@ -9,18 +11,101 @@ from ailment.expression import Const, BinaryOp
 
 from ... import AnalysesHub
 from .optimization_pass import OptimizationPass, OptimizationPassStage
-from ..utils import to_ail_supergraph, SuperAILNode
+from ..utils import to_ail_supergraph
 from ....utils.graph import dominates
 
 
 _l = logging.getLogger(name=__name__)
 
 
+#
+# Utils
+#
+
 def s2u(s, bits):
     if s > 0:
         return s
     return (1 << bits) + s
 
+
+def sub_lists(seq):
+    lists = [[]]
+    for i in range(len(seq) + 1):
+        for j in range(i):
+            lists.append(seq[j: i])
+    return lists
+
+
+def pattern_in_seq(pattern, seq):
+    """
+    Uses the Knuth-Morris-Pratt algorithm for searching.
+    Found: https://code.activestate.com/recipes/117214/.
+
+    Returns a generator of positions, which will be empty if its not found.
+    """
+    # allow indexing into pattern and protect against change during yield
+    pattern = list(pattern)
+
+    # build table of shift amounts
+    shifts = [1] * (len(pattern) + 1)
+    shift = 1
+    for pos in range(len(pattern)):
+        while shift <= pos and pattern[pos] != pattern[pos - shift]:
+            shift += shifts[pos - shift]
+        shifts[pos + 1] = shift
+
+    # do the actual search
+    start_pos = 0
+    match_len = 0
+    for c in seq:
+        while match_len == len(pattern) or match_len >= 0 and pattern[match_len] != c:
+            start_pos += shifts[match_len]
+            match_len -= shifts[match_len]
+        match_len += 1
+        if match_len == len(pattern):
+            yield start_pos
+
+
+def ail_block_from_stmts(stmts, idx=None) -> Optional[Block]:
+    if not stmts:
+        return None
+
+    first_stmt = stmts[0]
+
+    return Block(
+        first_stmt.tags['ins_addr'],
+        0,
+        statements=stmts,
+        idx=idx or 1,
+    )
+
+
+class MergeTarget:
+    def __init__(self, target, dup_idx, dup_len, graph: nx.DiGraph):
+        self.target = target
+        self._graph = graph
+
+        self.target_addr = target.addr
+        self.predecessors = list()
+        self.pre_block: Block = None
+        self.merge_block: Block = None
+        self.post_block: Block = None
+        self.successors = list()
+
+        self._construct_blocks(dup_idx, dup_len)
+
+    def _construct_blocks(self, dup_idx, dup_len):
+        self.pre_block = ail_block_from_stmts(self.target.statements[:dup_idx])
+        self.merge_block = ail_block_from_stmts(self.target.statements[dup_idx:dup_idx+dup_len])
+        self.post_block = ail_block_from_stmts(self.target.statements[dup_idx+dup_len:])
+
+        self.predecessors = list(self._graph.predecessors(self.target))
+        self.successors = list(self._graph.successors(self.target))
+
+
+#
+# Merger Optimization
+#
 
 class BlockMerger(OptimizationPass):
 
@@ -45,10 +130,10 @@ class BlockMerger(OptimizationPass):
     #
 
     def _shares_common_path(self, node1, node2):
-        pre1 = list(self.super_graph.predecessors(node1))
-        pre2 = list(self.super_graph.predecessors(node2))
-        ans1 = list(nx.algorithms.ancestors(self.super_graph, node1))
-        ans2 = list(nx.algorithms.ancestors(self.super_graph, node2))
+        pre1 = list(self.copy_graph.predecessors(node1))
+        pre2 = list(self.copy_graph.predecessors(node2))
+        ans1 = list(nx.algorithms.ancestors(self.copy_graph, node1))
+        ans2 = list(nx.algorithms.ancestors(self.copy_graph, node2))
 
         return all([p1 in ans2 for p1 in pre1]) and all([p2 in ans1 for p2 in pre2])
 
@@ -56,11 +141,11 @@ class BlockMerger(OptimizationPass):
     # Analysis stages
     #
 
-    def _fast_find_initial_candidates(self) -> List[Tuple[SuperAILNode, SuperAILNode]]:
+    def _fast_find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         init_candidates = []
-        for block in self.super_graph.nodes():
+        for block in self.copy_graph.nodes():
             if block.statements and isinstance(block.statements[-1], ConditionalJump):
-                successors: List[Block] = list(self.super_graph.successors(block))
+                successors: List[Block] = list(self.copy_graph.successors(block))
                 if len(successors) == 2:
                     succ1, succ2 = successors[:]
                     for stmt in succ1.statements:
@@ -90,145 +175,140 @@ class BlockMerger(OptimizationPass):
         """
         Entry analysis routine that will trigger the other analysis stages
         """
-        self.out_graph = self._graph.copy()
-        self.super_graph = to_ail_supergraph(self._graph)
+        return
+        # do all writes on out_graph and all reads on copy_graph
+        self.out_graph = to_ail_supergraph(self._graph)
+        self.copy_graph = self.out_graph.copy()
 
         candidates = self._fast_find_initial_candidates()
         if not candidates:
-            raise Exception("There are no duplicate statements in this function")
+            print("There are no duplicate statements in this function")
+            return
 
-        candidates = self._filter_candidates(candidates)
+        #candidates = self._filter_candidates(candidates)
         if not candidates:
-            raise Exception("There are no duplicate blocks in this function")
+            print("There are no duplicate blocks in this function")
+            return
 
-        return
+        print(f"CANDIDATES FOUND: {candidates}")
+        for block0, block1 in candidates:
+            # 1: locate the duplicated statements
+            stmts0, stmts1 = block0.statements, block1.statements
+            stmt_seqs = sub_lists(stmts0)
+            matches = [(stmt_seq, list(pattern_in_seq(stmt_seq, stmts1))) for stmt_seq in stmt_seqs]
+            match_seq, match_pos_in_1 = max(matches, key=lambda m: len(m[0]) if len(m[1]) > 0 else -1)
 
+            if not match_pos_in_1:
+                raise Exception("Matching blocks somehow have no matching statements!")
 
-        final_candidates = []
-        for if_stmt, block_00, block_01 in candidates:
-            removal_trgt = max((block_00, block_01), key=lambda b: len(list(super_graph.successors(b))))
-            merge_trgt = block_00 if block_01 is removal_trgt else block_01
+            if len(match_pos_in_1) != 1:
+                raise Exception("There are too many matching statements in this block")
 
-            # looking for a series of statements that starts in merge_trgt, and ends in removal_trgt
-            for i, stmt in enumerate(merge_trgt.statements):
-                if stmt != removal_trgt.statements[0]:
+            # split the blocks statements based on the matching position
+            match_pos_in_1 = match_pos_in_1[0]
+            match_pos_in_0 = list(pattern_in_seq(match_seq, stmts0))[0]
+            match_len = len(match_seq)
+            merge_targets: Dict[int, MergeTarget] = {
+                blk.addr: MergeTarget(blk, idx, match_len, self.copy_graph)
+                for blk, idx in ((block0, match_pos_in_0), (block1, match_pos_in_1))
+            }
+            merge_block = merge_targets[block0.addr].merge_block
+
+            # 2: destroy the old blocks that will be merged
+            self.out_graph.remove_nodes_from((block0, block1))
+            self.out_graph.add_node(merge_block)
+
+            # 3: replace the edges of the pre blocks
+            merge_trgt_preds = list()
+            for _, trgt in merge_targets.items():
+                merge_trgt_preds += trgt.predecessors
+
+            for pred in set(merge_trgt_preds):
+                if not isinstance(pred.statements[-1], ConditionalJump):
+                    print(f"not conditional {pred}")
                     continue
 
-                # sequence starts and ends the same
-                common_sequence = merge_trgt.statements[i:]
-                if common_sequence == removal_trgt.statements[:len(common_sequence)]:
-                    final_candidates.append((if_stmt, merge_trgt, removal_trgt, i, len(common_sequence)))
-                    print(f"FINAL CANDIDATES SELECTED\n{if_stmt}\n{merge_trgt}\n{removal_trgt}")
+                import ipdb; ipdb.set_trace()
+                if_stmt: ConditionalJump = pred.statements[-1]
+                for suc in self.copy_graph.successors(pred):
+                    if suc.addr not in merge_targets:
+                        print(f"skipping, {hex(suc.addr)} | {suc}")
+                        continue
+                    print(f"working on {hex(suc.addr)} | {suc}")
 
-            else:
-                continue
+                    merge_target = merge_targets[suc.addr]
+                    new_block = merge_target.pre_block if merge_target.pre_block else merge_block
+                    self.out_graph.add_edge(pred, new_block)
 
-        for if_stmt, merge_trgt, removal_trgt, merge_split, common_len in final_candidates:
-            #TODO: huge guess here, but every node only has one statement
-
-            # split the super blocks back into nodes
-            m1, m2 = merge_trgt.nodes[:merge_split], merge_trgt.nodes[merge_split:]
-            r1, r2 = removal_trgt.nodes[:common_len], removal_trgt.nodes[common_len:]
-
-
-            # destroy the old conditionals to r1 top
-            r1_preds = list(self._graph.predecessors(r1[0]))
-            r1_conds = []
-            for pred in r1_preds:
-                self.out_graph.remove_edge(pred, r1[0])
-
-                # make them point to m2 now
-                if isinstance(pred.statements[0], ConditionalJump):
-                    # TODO: fixme
-                    r1_conds.append(pred.statements[0].copy())
-                    pred.statements[0].false_target = Const(None, None, m2.addr, self.project.arch.bits)
-
-            # get rid of r1
-            for node in r1:
-                self.out_graph.remove_node(node)
-
-            m2_succ = list(self._graph.successors(m2[-1]))
-            assert len(m2_succ) == 1
-
-            self.out_graph.remove_edge(m2[-1], m2_succ[0])
-
-            for cond_node in r1_conds:
-                pass
+                    new_target = if_stmt.true_target if if_stmt.true_target.value == suc.addr else if_stmt.false_target
+                    print(f"updating {new_target} OF {if_stmt} WITH {hex(new_target.value)}")
+                    new_target.value = new_block.addr
+                    print(f"now: {new_target}")
 
 
+            # 4: make the pre blocks point to the merge block
+            for _, trgt in merge_targets.items():
+                if trgt.pre_block:
+                    self.out_graph.add_edge(trgt.pre_block, merge_block)
 
+            # 5: make the merge block point to the conditional clones
+            # copy conditionals
+            conditionals = list(self.copy_graph.predecessors(block0)) \
+                if self.copy_graph.in_degree(block0) > self.copy_graph.in_degree(block1) \
+                else list(self.copy_graph.predecessors(block1))
 
+            # place conditionals in the output
+            added_nodes = list()
+            cond_graph: nx.DiGraph = self.copy_graph.subgraph(conditionals)
+            for u, v in cond_graph.edges():
+                new_u = ail_block_from_stmts([u.statements[-1]])
+                new_u.addr += 1
+                new_v = ail_block_from_stmts(v.statements)
+                new_v.addr += 1
+                self.out_graph.add_edge(new_u, new_v)
+                added_nodes += [new_u, new_v]
 
-        candidates = []
-        # find a block with a call and an immediate following branch
-        for block_id, block in self.blocks_by_addr_and_idx.items():
-            if block.statements and isinstance(block.statements[-1], Call):
-                # check its successor
-                successors: List[Block] = list(self._graph.successors(block))
-                if len(successors) == 1:
-                    succ = successors[0]
-                    if succ.statements and isinstance(succ.statements[-1], ConditionalJump):
-                        # found one
-                        candidates.append((block, succ))
-
-        final_candidates = [ ]
-        for block_00, block_01 in candidates:
-            for block_10, block_11 in candidates:
-                if len(block_00.statements) == 1 and len(block_10.statements) > 1 and str(block_00.statements[-1]) == str(block_10.statements[-1]):  # FIXME: don't use str()
-                    # found it!
-                    final_candidates.append((block_00, block_01, block_10, block_11))
+            for node in added_nodes:
+                if self.out_graph.in_degree(node) == 0:
                     break
-
-        for block_00, block_01, block_10, block_11 in final_candidates:
-            # old blocks: block_10 + block_11
-            # mirror block: block_00 + block_01
-
-            # parse the condition at the end of block_01
-            assert isinstance(block_01.statements[-1], ConditionalJump)
-            assert isinstance(block_01.statements[-1].true_target, Const)
-            assert isinstance(block_01.statements[-1].false_target, Const)
-            block_01_cond = block_01.statements[-1].condition
-            block_01_truetarget = block_01.statements[-1].true_target.value
-            block_01_falsetarget = block_01.statements[-1].false_target.value
-
-            mirror_block_successor = list(self._graph.successors(block_11))
-            assert len(mirror_block_successor) == 2
-
-            # TODO:
-
-            new_block_10 = block_10.copy()
-            new_block_10.statements = new_block_10.statements[:1]
-
-            self._update_block(block_10, new_block_10)
-
-            stmt: Statement = block_11.statements[-1]
-            if isinstance(stmt, ConditionalJump):
-
-                # TODO: do a proper condition matching instead of only testing the operator
-                if stmt.condition.op == block_01_cond.op:
-                    jump_to = block_01_truetarget
-                elif stmt.condition.op == BinaryOp.COMPARISON_NEGATION[block_01_cond.op]:
-                    jump_to = block_01_falsetarget
-                else:
-                    # we cannot handle it. give up
-                    continue
-
-                # block_11 ends with a conditional jump, too, where one target is the same as one of block_01's
-                # branch targets, and the other is different
-                # we just make block_11 jump to block_00
-                block_11.statements[-1] = Jump(None, Const(None, None, block_00.addr, self.project.arch.bits),
-                                               **stmt.tags)
             else:
-                assert False
+                raise Exception("No ancestor node")
 
-            for _, dst, data in list(self.out_graph.out_edges(block_11, data=True)):
-                if dst.addr != jump_to:
-                    # print(f"Adding a new edge {block_to_change}, {mirror_block}")
-                    self.out_graph.add_edge(block_11, block_00, **data)
-                    # print(f"Removing edge {block_to_change}, {dst}")
-                    self.out_graph.remove_edge(block_11, dst)
-                else:
-                    self.out_graph.remove_edge(block_11, dst)
+            self.out_graph.add_edge(merge_block, node)
+
+            # 6: make the conditions go to the correct post blocks
+            return
+            for node in added_nodes:
+                if_stmt: ConditionalJump = node.statements[-1]
+                for attr in ['false_target', 'true_target']:
+                    target = getattr(if_stmt, attr)
+
+
+
+                    if target.value == block0.addr:
+                        if not post_block0:
+                            new_target = post_block_suc0.addr
+                            self.out_graph.add_edge(node, post_block_suc0)
+                        else:
+                            new_target = post_block0.addr
+                            self.out_graph.add_edge(node, post_block0)
+                        target.value = new_target
+
+                    if target.value == block1.addr:
+                        if not post_block1:
+                            new_target = post_block_suc1.addr
+                            self.out_graph.add_edge(node, post_block_suc1)
+                        else:
+                            new_target = post_block1.addr
+                            self.out_graph.add_edge(node, post_block1)
+                        target.value = new_target
+
+            # 7: make the post blocks continue to the next successors
+            for _, trgt in merge_targets.items():
+                if trgt.post_block:
+                    self.out_graph.add_edge(trgt.post_block, trgt.successors[0])
+
+            return
 
 
 
