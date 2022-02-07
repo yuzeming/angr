@@ -112,33 +112,6 @@ def deepcopy_ail_condjump(stmt: ConditionalJump):
     )
 
 
-class MergeTarget:
-    def __init__(self, target, dup_idx, dup_len, graph: nx.DiGraph):
-        self.target = target
-        self._graph = graph
-
-        self.target_addr = target.addr
-        self.predecessors = list()
-        self.pre_block: Block = None
-        self.merge_block: Block = None
-        self.post_block: Block = None
-        self.successors = list()
-
-        self._construct_blocks(dup_idx, dup_len)
-
-    def _construct_blocks(self, dup_idx, dup_len):
-        self.pre_block = ail_block_from_stmts(self.target.statements[:dup_idx])
-        self.merge_block = ail_block_from_stmts(self.target.statements[dup_idx:dup_idx+dup_len])
-        self.post_block = ail_block_from_stmts(self.target.statements[dup_idx+dup_len:])
-
-        self.predecessors = list(self._graph.predecessors(self.target))
-        self.successors = list(self._graph.successors(self.target))
-
-
-#
-# Merger Optimization
-#
-
 def _share_common_stmt(nodes):
     shared = []
     first_pass = True
@@ -193,7 +166,7 @@ def _longest_common_stmt_seq(blocks):
             if all(True if len(list(pattern_in_seq(lcs, other_lcs))) > 0 else False for other_lcs in lcs_list):
                 # assure we are not re-adding the same lcs
                 for clcs in common_lcs:
-                    if len(lcs) == len(clcs) and all(s1.likes(s2) for s1,s2 in zip(lcs, clcs)):
+                    if len(lcs) == len(clcs) and all(s1.likes(s2) for s1, s2 in zip(lcs, clcs)):
                         break
                 else:
                     common_lcs.append(lcs)
@@ -210,6 +183,61 @@ def _longest_common_stmt_seq(blocks):
         block_idxs[block] = list(pattern_in_seq(lcs, block.statements))[0]
 
     return lcs, block_idxs
+
+""""
+class MergeTarget:
+    def __init__(self, target, dup_idx, dup_len, graph: nx.DiGraph):
+        self.target = target
+        self._graph = graph
+
+        self.target_addr = target.addr
+        self.predecessors = list()
+        self.pre_block: Block = None
+        self.merge_block: Block = None
+        self.post_block: Block = None
+        self.successors = list()
+
+        self._construct_blocks(dup_idx, dup_len)
+
+    def _construct_blocks(self, dup_idx, dup_len):
+        self.pre_block = ail_block_from_stmts(self.target.statements[:dup_idx])
+        self.merge_block = ail_block_from_stmts(self.target.statements[dup_idx:dup_idx+dup_len])
+        self.post_block = ail_block_from_stmts(self.target.statements[dup_idx+dup_len:])
+
+        self.predecessors = list(self._graph.predecessors(self.target))
+        self.successors = list(self._graph.successors(self.target))
+"""
+
+class MergeTarget:
+    def __init__(self, merge_graph, pre_block_locs, post_block_locs, graph: nx.DiGraph):
+        """
+
+        @param merge_graph:
+        @param pre_block_locs: LisTuple: [(lcs_len, lcs_idx)]
+        @param post_block_locs: Tuple: (lcs_len, lcs_idx)
+        @param graph:
+        """
+        self.merge_graph = merge_graph
+        self._graph = graph
+
+        self.target_addr = None
+        self.predecessors = list()
+        self.pre_block: Block = None
+        self.merge_block: Block = None
+        self.post_block: Block = None
+        self.successors = list()
+
+        self._construct_blocks(pre_block_locs, post_block_locs)
+
+    def _construct_blocks(self, pre_block_locs, post_block_locs):
+        entry_blocks = [node for node in self._graph.nodes if self._graph.in_degree(node) == 0]
+        exit_blocks = []
+
+
+
+#
+# Merger Optimization
+#
 
 
 class BlockMerger(OptimizationPass):
@@ -246,9 +274,11 @@ class BlockMerger(OptimizationPass):
         return False
 
     def _copy_cond_graph(self, end_cond_nodes):
+        # special case: the graph is actually just a single node
         if len(end_cond_nodes) == 1:
-            #TODO: implement the simple version when you only have 1 condition
-            pass
+            new_cond_graph = nx.DiGraph()
+            new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(end_cond_nodes[0].statements[-1])]))
+            return new_cond_graph
 
         entry_blk = [node for node in self.copy_graph.nodes if self.copy_graph.in_degree(node) == 0][0]
         idoms = nx.algorithms.immediate_dominators(self.copy_graph, entry_blk)
@@ -323,8 +353,6 @@ class BlockMerger(OptimizationPass):
         """
         Preform a series of filters on the candidates to reduce the fast set to an assured set of
         the duplication case we are searching for.
-
-        TODO: need a way to group candidates that are more than a single pair, see if-else example
         """
         # filter down candidates
         filtered_candidates = []
@@ -369,6 +397,78 @@ class BlockMerger(OptimizationPass):
             print(f"filtered now: {filtered_candidates}")
 
         return filtered_candidates
+
+    def _graph_diff(self, start_blk0, start_blk1):
+        blocks = [start_blk0, start_blk1]
+        lcs, block_idxs = _longest_common_stmt_seq(blocks)
+        lcs_len = len(lcs)
+        block_splits = [(lcs, (start_blk0, block_idxs[0]), (start_blk1, block_idxs[1]))]
+
+        # check if both blocks end in the same statements
+        if not all(lcs_len + block_idx == len(block.statements) for block, block_idx in zip(blocks, block_idxs)):
+            return block_splits
+
+        # its an actual graph, do the search
+        successors = {
+            start_blk0: list(self.copy_graph.successors(start_blk0)),
+            start_blk1: list(self.copy_graph.successors(start_blk1))
+        }
+
+        if len(successors[start_blk0]) == len(successors[start_blk1]) == 1:
+            # check how the successors differ
+            return block_splits + self._graph_diff(successors[start_blk0][0], successors[start_blk1][0])
+        elif len(successors[start_blk0]) == len(successors[start_blk1]) == 2:
+            targets = {}
+            for block in blocks:
+                if_stmt = block.statements[-1]
+                true_target = successors[block][0] if successors[block][0].addr == if_stmt.true_target.value \
+                    else successors[block][1]
+                false_target = successors[block][1] if true_target != successors[block][1] \
+                    else successors[block][0]
+                targets[block] = {"true": true_target, "false": false_target}
+
+            # check how the true and false target successors differ
+            return block_splits + self._graph_diff(targets[start_blk0]["true"], targets[start_blk1]["true"]) + \
+                self._graph_diff(targets[start_blk0]["false"], targets[start_blk1]["false"])
+
+        # if none of th successors amt match, we end the search here
+        return block_splits
+
+    def _locate_merge_target_graph(self, blocks):
+        """
+        We locate the merge target graph as well as the places they differ.
+        Consider merge graphs:
+        Gx:    [A, B, C] -> [D,E] -> [F]
+        Gy:    [C] -> [D,E] -> [F, E]
+
+        Each merge graph has pre-blocks and post-blocks that will be split off
+        Gx-Pre-Blocks: [[A,B]]
+        Gy-Pre-Blocks: [None]
+        Gx-Post-Blocks: [None]
+        Gy-Post-Blocks: [[E]]
+
+        Plan:
+        1. Do two graphs at a time and try to find the longest common block seq
+
+        @param blocks:
+        @return:
+        """
+
+        # find the longest sequence in the potential heads of the graph
+        lcs, block_idxs = _longest_common_stmt_seq(blocks)
+        lcs_len = len(lcs)
+
+        # special case: if the longest common sequence does not end each block
+        if not all(lcs_len + block_idx == len(block.statements) for block, block_idx in zip(blocks, block_idxs)):
+            merge_target_graph = nx.DiGraph()
+            merge_target_graph.add_node()
+
+        # Algorithm:
+        # trav
+
+
+
+
 
     def _analyze(self, cache=None):
         """
