@@ -2,8 +2,6 @@ from typing import Optional, Tuple, Any
 
 import networkx
 
-import networkx
-
 import ailment
 
 from .structurer_nodes import MultiNode, BaseNode, CodeNode, SequenceNode, ConditionNode, SwitchCaseNode, \
