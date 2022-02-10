@@ -24,6 +24,13 @@ _l = logging.getLogger(name=__name__)
 # Utils
 #
 
+import toml
+def update_toml(toml_path, update_dict):
+    with open(toml_path, "r") as fp:
+        data = toml.load(fp)
+    data.update(update_dict)
+    with open(toml_path, "w") as fp:
+        toml.dump(data, fp)
 
 def graph_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
     if insn_addr:
@@ -351,8 +358,12 @@ def remove_graph_single_gotos(graph: nx.DiGraph):
             continue
 
         # confirmed we want to remove this
+        succ = list(graph.successors(block))
+        if len(succ) <= 0:
+            continue
+
+        succ = succ[0]
         remove_queue.append(block)
-        succ = list(graph.successors(block))[0]
         for pred in graph.predecessors(block):
             if isinstance(pred.statements[-1], ConditionalJump):
                 if_stmt = pred.statements[-1]
@@ -489,6 +500,22 @@ class BlockMerger(OptimizationPass):
 
             filtered_candidates.append(candidate)
 
+        # XXX: REMOVE ME AFTER EVAL
+        #
+        #
+        status = {
+            "success": True,
+            "duplicate_pairs": 0,
+            "duplicate_locations": []
+        }
+        for b0, b1 in filtered_candidates:
+            status["duplicate_locations"].append((b0.addr, b1.addr))
+        status["duplicate_pairs"] = len(filtered_candidates)
+        name = self._func.name if self._func.name else hex(self._func.addr)
+        update_toml(f"{self.project.filename}.toml", {name: status})
+        return
+
+
         # merge candidates
         not_fixed = True
         _l.info(f"filtered starting: {filtered_candidates}")
@@ -590,10 +617,18 @@ class BlockMerger(OptimizationPass):
 
         candidates = self._fast_find_initial_candidates()
         if not candidates:
+            status = {
+                "success": True,
+                "duplicate_pairs": 0,
+                "duplicate_locations": []
+            }
+            name = self._func.name if self._func.name else hex(self._func.addr)
+            update_toml(f"{self.project.filename}.toml", {name: status})
             _l.info("There are no duplicate statements in this function")
             return
 
         candidates = self._filter_candidates(candidates)
+        return
         if not candidates:
             _l.info("There are no duplicate blocks in this function")
             return
