@@ -500,22 +500,6 @@ class BlockMerger(OptimizationPass):
 
             filtered_candidates.append(candidate)
 
-        # XXX: REMOVE ME AFTER EVAL
-        #
-        #
-        status = {
-            "success": True,
-            "duplicate_pairs": 0,
-            "duplicate_locations": []
-        }
-        for b0, b1 in filtered_candidates:
-            status["duplicate_locations"].append((b0.addr, b1.addr))
-        status["duplicate_pairs"] = len(filtered_candidates)
-        name = self._func.name if self._func.name else hex(self._func.addr)
-        update_toml(f"{self.project.filename}.toml", {name: status})
-        return
-
-
         # merge candidates
         not_fixed = True
         _l.info(f"filtered starting: {filtered_candidates}")
@@ -608,6 +592,7 @@ class BlockMerger(OptimizationPass):
 
 
     def _analyze(self, cache=None):
+        return
         """
         Entry analysis routine that will trigger the other analysis stages
         """
@@ -617,18 +602,10 @@ class BlockMerger(OptimizationPass):
 
         candidates = self._fast_find_initial_candidates()
         if not candidates:
-            status = {
-                "success": True,
-                "duplicate_pairs": 0,
-                "duplicate_locations": []
-            }
-            name = self._func.name if self._func.name else hex(self._func.addr)
-            update_toml(f"{self.project.filename}.toml", {name: status})
             _l.info("There are no duplicate statements in this function")
             return
 
         candidates = self._filter_candidates(candidates)
-        return
         if not candidates:
             _l.info("There are no duplicate blocks in this function")
             return
