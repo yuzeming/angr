@@ -291,7 +291,7 @@ class BlockDiff:
                 (len(self.blk1.statements) != len(self.lcs) + self.blk1_lcs_idx):
             self.differs = True
 
-def ail_graph_diff(start_blk0: Block, start_blk1: Block, graph: nx.DiGraph, partial=False) -> List[BlockDiff]:
+def ail_graph_diff(start_blk0: Block, start_blk1: Block, graph: nx.DiGraph, partial=True) -> List[BlockDiff]:
     """
     Takes the start blocks of two sub-graphs that reside in graph. It returns a list of blocks that are similar
     in the subgraphs. The tuple will provide the blocks that are similar in both graphs.
@@ -439,12 +439,14 @@ def lcs_ail_graph_blocks(start_blocks: List[Block], graph: nx.DiGraph):
         common_graph.add_nodes_from(split_blocks)
     # needs correcting for split blocks
     else:
-        common_graph: nx.DiGraph = nx.subgraph(graph, common_graph_blocks)
+        common_graph = nx.subgraph(graph, common_graph_blocks)
+        common_graph = common_graph.copy()
 
         for split_block in split_blocks:
             og_block = split_to_orig_map[split_block]
 
             # start with tail splits
+            breakpoint()
             if any(common_graph.has_node(pred) for pred in graph.predecessors(og_block)):
                 common_graph = replace_node(og_block, split_block, graph, common_graph, fix_successors=False)
 
@@ -631,7 +633,6 @@ class BlockMerger(OptimizationPass):
 
         # make a conditional graph from any remove_nodes map (no deepcopy)
         cond_graph = nx.subgraph(self.copy_graph, removed_node_map[merge_start_nodes[0]])
-        breakpoint()
 
         # deep copy the graph and remove instructions that are not conditionals
         new_cond_graph = nx.DiGraph()
@@ -874,11 +875,11 @@ class BlockMerger(OptimizationPass):
                 return
 
             print(f"CANDIDATES FOUND: {candidates}")
+            candidates = sorted(candidates, key=lambda x: len(x))
 
             for blocks in candidates:
                 # 1: locate the longest duplicate sequence in a graph and split it at the merge
                 merge_graph, merge_targets, removable_nodes = self.generate_merge_targets(blocks, self.copy_graph)
-                breakpoint()
                 merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
                 merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
 
@@ -913,12 +914,11 @@ class BlockMerger(OptimizationPass):
                     # every end node in the merge graph needs a conditional graph to copy and assign
                     merge_end_to_cond_graph = {}
                     for i, merge_end in enumerate(merge_ends):
-                        #cond_graph = self._copy_cond_graph(list(merge_target_preds), idx=i+1)
-                        cond_graph = self._copy_cond_graph(blocks, idx=i+1)
+                        cond_graph, pre_graph_map = self._copy_cond_graph(blocks, idx=i+1)
                         root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
                         merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
 
-                # 4: replace the edges from the original condition to a pre/merge block
+                # 4: replace the edges from the original condition to a pre/merge start
                 for _, merge_target in merge_targets.items():
                     for pre_blk, old_blk in merge_target.pre_block_map.items():
                         new_block = pre_blk if pre_blk else merge_start
