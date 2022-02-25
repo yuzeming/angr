@@ -22,7 +22,7 @@ _l = logging.getLogger(name=__name__)
 
 
 #
-# Utils
+# Graph Utils
 #
 
 def find_block_by_similarity(block, graph, node_list=None):
@@ -52,6 +52,10 @@ def find_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
         raise Exception("The block is not in the graph!")
 
     return block
+
+#
+# AIL Helpers
+#
 
 
 def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=False):
@@ -99,15 +103,47 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=False):
         return False
 
 
-def sub_lists(seq):
-    lists = [[]]
-    for i in range(len(seq) + 1):
-        for j in range(i):
-            lists.append(seq[j: i])
-    return lists
+def ail_block_from_stmts(stmts, idx=None) -> Optional[Block]:
+    if not stmts:
+        return None
+
+    first_stmt = stmts[0]
+
+    return Block(
+        first_stmt.tags['ins_addr'],
+        0,
+        statements=stmts,
+        idx=idx or 1,
+    )
 
 
-def kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=False):
+def split_ail_block(block, split_idx, split_len) -> Tuple[Optional[Block], Optional[Block], Optional[Block]]:
+    pre_split = ail_block_from_stmts(block.statements[:split_idx])
+    merge_split = ail_block_from_stmts(block.statements[split_idx:split_idx + split_len])
+    post_split = ail_block_from_stmts(block.statements[split_idx + split_len:])
+
+    return pre_split, merge_split, post_split
+
+
+def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
+    true_target: Const = stmt.true_target
+    false_target: Const = stmt.false_target
+    tags = stmt.tags.copy()
+
+    return ConditionalJump(
+        idx,
+        stmt.condition.copy(),
+        Const(1, true_target.variable, true_target.value, true_target.bits, **true_target.tags.copy()),
+        Const(1, false_target.variable, false_target.value, false_target.bits, **false_target.tags.copy()),
+        **tags
+    )
+
+
+#
+# Longest Common Substring Helpers
+#
+
+def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=False):
     """
     Uses the Knuth-Morris-Pratt algorithm for searching.
     Found: https://code.activestate.com/recipes/117214/.
@@ -138,32 +174,70 @@ def kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=False):
             yield start_pos
 
 
-def ail_block_from_stmts(stmts, idx=None) -> Optional[Block]:
-    if not stmts:
+def stmts_pos_in_other(stmts, other, graph=None):
+    """
+    Equivalent to asking:
+    stmts in other
+
+    @return: None or int (position start in other)
+    """
+    positions = list(_kmp_search_ail_obj(stmts, other, graph=graph))
+
+    if len(positions) == 0:
         return None
 
-    first_stmt = stmts[0]
-
-    return Block(
-        first_stmt.tags['ins_addr'],
-        0,
-        statements=stmts,
-        idx=idx or 1,
-    )
+    top_pos = positions.pop()
+    return top_pos
 
 
-def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
-    true_target: Const = stmt.true_target
-    false_target: Const = stmt.false_target
-    tags = stmt.tags.copy()
+def stmt_in_other(stmts, other, graph=None):
+    """
+    Returns True if the stmts (a list of Statement) is found as a subsequence in other
 
-    return ConditionalJump(
-        idx,
-        stmt.condition.copy(),
-        Const(1, true_target.variable, true_target.value, true_target.bits, **true_target.tags.copy()),
-        Const(1, false_target.variable, false_target.value, false_target.bits, **false_target.tags.copy()),
-        **tags
-    )
+    @return:
+    """
+
+    if stmts_pos_in_other(stmts, other, graph=graph) is not None:
+        return True
+
+    return False
+
+
+def longest_ail_subseq(stmts_list, graph=None):
+    """
+    Returns the LCS (a list of Statement) of the list of stmts (list of Statement).
+    Returns LCS, [LCS_POS_IN_0, LCS_POS_IN_1, ..., LCS_POS_IN_N]
+
+    @param stmts_list:
+    @param graph:
+    @return:
+    """
+
+    # find the longest sequence in all stmts
+    subseq = []
+    if len(stmts_list) > 1 and len(stmts_list[0]) > 0:
+        for i in range(len(stmts_list[0])):
+            for j in range(len(stmts_list[0]) - i + 1):
+                if j > len(subseq) and all(stmt_in_other(stmts_list[0][i:i+j], stmts, graph=graph) for stmts in stmts_list):
+                    subseq = stmts_list[0][i:i + j]
+
+    if not subseq:
+        return None, [None]*len(stmts_list)
+
+    return subseq, [stmts_pos_in_other(subseq, stmts) for stmts in stmts_list]
+
+
+
+#
+# OLD SHIT
+#
+
+def sub_lists(seq):
+    lists = [[]]
+    for i in range(len(seq) + 1):
+        for j in range(i):
+            lists.append(seq[j: i])
+    return lists
 
 
 def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_graph: nx.DiGraph,
@@ -215,12 +289,6 @@ def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_gr
     return new_graph
 
 
-def split_ail_block(block, split_idx, split_len) -> Tuple[Optional[Block], Optional[Block], Optional[Block]]:
-    pre_split = ail_block_from_stmts(block.statements[:split_idx])
-    merge_split = ail_block_from_stmts(block.statements[split_idx:split_idx + split_len])
-    post_split = ail_block_from_stmts(block.statements[split_idx + split_len:])
-
-    return pre_split, merge_split, post_split
 
 
 def lcs_ail_stmts(blocks, graph=None, partial=False):
@@ -230,7 +298,7 @@ def lcs_ail_stmts(blocks, graph=None, partial=False):
     for b0, b1 in combinations(blocks, 2):
         stmts0, stmts1 = b0.statements, b1.statements
         stmt_seqs = sub_lists(stmts0)
-        matches = [(stmt_seq, list(kmp_search_ail_obj(stmt_seq, stmts1, graph=graph, partial=partial))) for stmt_seq in stmt_seqs]
+        matches = [(stmt_seq, list(_kmp_search_ail_obj(stmt_seq, stmts1, graph=graph, partial=partial))) for stmt_seq in stmt_seqs]
         match_seq, match_pos_in_1 = max(matches, key=lambda m: len(m[0]) if len(m[1]) > 0 else -1)
         lcs_list.append(match_seq)
 
@@ -250,7 +318,7 @@ def lcs_ail_stmts(blocks, graph=None, partial=False):
 
         # check each lcs against the others in the list
         for lcs in lcs_list:
-            if all(True if len(list(kmp_search_ail_obj(lcs, other_lcs, graph=graph, partial=partial))) > 0 else False for other_lcs in lcs_list):
+            if all(True if len(list(_kmp_search_ail_obj(lcs, other_lcs, graph=graph, partial=partial))) > 0 else False for other_lcs in lcs_list):
                 # assure we are not re-adding the same lcs
                 for clcs in common_lcs:
                     if len(lcs) == len(clcs) and all(similar(s1, s2) for s1, s2 in zip(lcs, clcs)):
@@ -270,7 +338,7 @@ def lcs_ail_stmts(blocks, graph=None, partial=False):
 
     block_idxs = {}
     for block in blocks:
-        block_idxs[block] = list(kmp_search_ail_obj(lcs, block.statements, graph=graph, partial=partial))[0]
+        block_idxs[block] = list(_kmp_search_ail_obj(lcs, block.statements, graph=graph, partial=partial))[0]
 
     return lcs, block_idxs
 
@@ -292,7 +360,7 @@ class BlockDiff:
             self.differs = True
 
 
-def ail_graph_diff(start_blk0: Block, start_blk1: Block, graph: nx.DiGraph, partial=True) -> List[BlockDiff]:
+def ail_graph_diff(start_blk0: Block, start_blk1: Block, graph: nx.DiGraph, partial=False) -> List[BlockDiff]:
     """
     Takes the start blocks of two sub-graphs that reside in graph. It returns a list of blocks that are similar
     in the subgraphs. The tuple will provide the blocks that are similar in both graphs.
@@ -396,10 +464,13 @@ def lcs_ail_graph_blocks(start_blocks: List[Block], graph: nx.DiGraph):
 
         # check each diff against the others
         for graph_diff in similar_graph_diffs:
+            if graph_diff in common_graph_diffs:
+                continue
+
             all_match = True
             for other_diff in similar_graph_diffs:
                 # skip the same diff (not like similar)
-                if graph_diff == other_diff:
+                if graph_diff is other_diff:
                     continue
 
                 if len(graph_diff) > len(other_diff):
@@ -410,6 +481,10 @@ def lcs_ail_graph_blocks(start_blocks: List[Block], graph: nx.DiGraph):
                 for i, block in enumerate(graph_diff):
                     # both the start and end can have a split
                     if i == 0 or i == len(graph_diff)-1:
+                        if len(block.statements) > len(other_diff[i].statements):
+                            all_match = False
+                            break
+
                         lcs, _ = lcs_ail_stmts([block, other_diff[i]], graph=graph)
                         if not lcs:
                             all_match = False
@@ -426,8 +501,11 @@ def lcs_ail_graph_blocks(start_blocks: List[Block], graph: nx.DiGraph):
                             all(similar(s1, s2, graph=graph) for s1, s2 in zip(graph_diff, cgd)):
                         break
                 else:
+                    breakpoint()
                     common_graph_diffs.append(graph_diff)
                     not_fixed = True
+            else:
+                not_fixed = False
 
         similar_graph_diffs = common_graph_diffs
 
@@ -831,6 +909,7 @@ class BlockMerger(OptimizationPass):
         @return:
         """
         merge_targets: Dict[Block, MergeTarget] = {}
+        #breakpoint()
         merge_graph, original_block_map, removable_blocks = lcs_ail_graph_blocks(blocks, graph)
         merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
         secondary_remove_set = set() #TODO: this is bad
