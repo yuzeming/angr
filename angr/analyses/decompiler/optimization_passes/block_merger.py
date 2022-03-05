@@ -142,11 +142,11 @@ def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
     )
 
 
-def copy_graph_and_nodes(graph: nx.DiGraph) -> nx.DiGraph:
+def copy_graph_and_nodes(graph: nx.DiGraph, new_nodes=False) -> nx.DiGraph:
     new_graph = networkx.DiGraph()
     for node in graph.nodes:
-        #    graph.add_node(ail_block_from_stmts(node.statements, block_addr=node.addr))
-        new_graph.add_node(node.copy())
+        new_graph.add_node(ail_block_from_stmts(node.statements, block_addr=node.addr))
+        #new_graph.add_node(node.copy())
 
     for edge in graph.edges:
         old_b0, old_b1 = edge
@@ -277,7 +277,6 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
     }
 
     graph = copy_graph_and_nodes(graph_param)
-    breakpoint()
     # this loop will continue to iterate until there are no more
     # nodes found in the split_map to change
     while True:
@@ -290,19 +289,17 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
             except KeyError:
                 continue
 
-            if new_node == node:
-                continue
-
             break
         else:
             break
-
 
         graph.add_node(new_node)
         for pred in graph.predecessors(node):
             last_stmt = pred.statements[-1]
             if isinstance(last_stmt, ConditionalJump):
                 pred.statements[-1] = correct_conditional_jump(last_stmt, {node.addr: new_node.addr}, new_stmt=True)
+            elif isinstance(last_stmt, Jump):
+                pred.statements[-1].target.value = new_node.addr
 
             graph.add_edge(pred, new_node)
 
@@ -310,7 +307,7 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
             graph.add_edge(new_node, succ)
 
         graph.remove_node(node)
-    breakpoint()
+
     for node in graph.nodes():
         last_stmt = node.statements[-1]
         if isinstance(last_stmt, ConditionalJump):
@@ -320,18 +317,6 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
             )
 
     return graph
-
-
-#
-# OLD SHIT
-#
-
-def sub_lists(seq):
-    lists = [[]]
-    for i in range(len(seq) + 1):
-        for j in range(i):
-            lists.append(seq[j: i])
-    return lists
 
 
 def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_graph: nx.DiGraph,
@@ -384,77 +369,6 @@ def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_gr
         new_graph.add_node(new_node)
 
     return new_graph
-
-
-
-
-def lcs_ail_stmts(blocks, graph=None, partial=False):
-    print(f"RUNNING LCS ON {blocks}")
-    # generate the lcs for each pair
-    lcs_list = list()
-    for b0, b1 in combinations(blocks, 2):
-        stmts0, stmts1 = b0.statements, b1.statements
-        stmt_seqs = sub_lists(stmts0)
-        matches = [(stmt_seq, list(_kmp_search_ail_obj(stmt_seq, stmts1, graph=graph, partial=partial))) for stmt_seq in stmt_seqs]
-        match_seq, match_pos_in_1 = max(matches, key=lambda m: len(m[0]) if len(m[1]) > 0 else -1)
-        lcs_list.append(match_seq)
-
-    # take each pairs lcs and find the lcs of those lcs (to get the overall lcs)
-    #print(f"LCS LIST: {lcs_list}")
-    not_fixed = True
-    while not_fixed:
-        not_fixed = False
-        common_lcs = list()
-
-        # stop once we only have one
-        if len(lcs_list) == 1:
-            if lcs_list[0] is None:
-                return None, {}
-
-            break
-
-        # check each lcs against the others in the list
-        for lcs in lcs_list:
-            if all(True if len(list(_kmp_search_ail_obj(lcs, other_lcs, graph=graph, partial=partial))) > 0 else False for other_lcs in lcs_list):
-                # assure we are not re-adding the same lcs
-                for clcs in common_lcs:
-                    if len(lcs) == len(clcs) and all(similar(s1, s2) for s1, s2 in zip(lcs, clcs)):
-                        break
-                else:
-                    common_lcs.append(lcs)
-                    not_fixed |= True
-
-        lcs_list = common_lcs
-        _l.info(f"LCS LIST ITERATION: {lcs_list}")
-
-    # finally, locate the lcs in all blocks
-    try:
-        lcs = lcs_list[0]
-    except IndexError:
-        return None, None
-
-    block_idxs = {}
-    for block in blocks:
-        block_idxs[block] = list(_kmp_search_ail_obj(lcs, block.statements, graph=graph, partial=partial))[0]
-
-    return lcs, block_idxs
-
-
-class BlockDiff:
-    def __init__(self, lcs, blk0, blk0_lcs_idx, blk1, blk1_lcs_idx):
-        self.differs = False
-        self.lcs = lcs
-        self.blk0 = blk0
-        self.blk0_lcs_idx = blk0_lcs_idx
-        self.blk1 = blk1
-        self.blk1_lcs_idx = blk1_lcs_idx
-
-        self._check_differ()
-
-    def _check_differ(self):
-        if (len(self.blk0.statements) != len(self.lcs) + self.blk0_lcs_idx) or \
-                (len(self.blk1.statements) != len(self.lcs) + self.blk1_lcs_idx):
-            self.differs = True
 
 
 def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_blocks=False):
@@ -559,182 +473,13 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
             break
 
         orig_blocks.append(block)
-        split_blocks[block] = (lcs, lcs_idxs[0])
+
+        if len(lcs) != len(block.statements):
+            split_blocks[block] = (lcs, lcs_idxs[0])
 
         graph_sim = graph_sim[len(lcs):]
 
     return orig_blocks, split_blocks
-
-
-
-
-
-
-    """ 
-    orig_stmt_len = len(orig_block.statements)
-    lcs, _ = longest_ail_subseq([orig_block.statements, graph_similarity[:orig_stmt_len]], graph=graph)
-    if not lcs:
-        return []
-
-    graph_similarity = graph_similarity[len(lcs):]
-    if len(graph_similarity) == 0:
-        return [orig_block]
-
-    successors = list(graph.successors(orig_block))
-    if len(successors) == 1:
-        return [orig_block] + ail_similarity_to_orig_blocks(successors[0], graph_similarity, graph)
-    elif len(successors) == 2:
-        if_stmt: ConditionalJump = orig_block.statements[-1]
-        true_blk = successors[0] if successors[0].addr == if_stmt.true_target.value else successors[1]
-        false_blk = successors[1] if true_blk == successors[0] else successors[0]
-
-        orig_true_len = len(true_blk.statements)
-        true_lcs, _ = longest_ail_subseq([true_blk.statements, graph_similarity[:orig_true_len]], graph=graph)
-        true_lcs_len = len(true_lcs) if true_lcs else 0
-
-        false_true_len = len(false_blk.statements)
-        false_lcs, _ = longest_ail_subseq([false_blk.statements, graph_similarity[:orig_false_len]], graph=graph)
-        false_lcs_len = len(false_lcs) if false_lcs else 0
-
-        false_succ = list(graph.successors(false_blk))
-        if true_blk in false_succ:
-            false_graph_sim = graph_similarity[true_lcs_len:true_lcs_len + false_lcs_len] \
-                + graph_similarity[true_lcs_len:]
-        else:
-            false_graph_sim = graph_similarity[true_lcs_len:]
-
-        return [orig_block] + ail_similarity_to_orig_blocks(true_blk, graph_similarity, graph) + \
-            ail_similarity_to_orig_blocks(false_blk, graph_similarity[true_lcs_len:], graph)
-
-    return [orig_block]
-    """
-
-
-def lcs_ail_graph_blocks(start_blocks: List[Block], graph: nx.DiGraph):
-    """
-    This algorithm will take a series of blocks, that should be the head of a graph, and attempt to find
-    a common subgraph among them.
-
-    @param start_blocks:
-    @param graph:
-    @return:
-    """
-
-    split_to_orig_map = {}
-    orig_to_split_map = {}
-
-    def _similar_blocks_from_graph_diff(graph_diff: List[BlockDiff]):
-        similar_blocks = []
-        for diff in graph_diff:
-            # if there is a differ we need to split it
-            if diff.differs:
-                pre, b0, post = split_ail_block(diff.blk0, diff.blk0_lcs_idx, len(diff.lcs))
-                pre_1, b1, post_1 = split_ail_block(diff.blk1, diff.blk1_lcs_idx, len(diff.lcs))
-                split_to_orig_map[b0] = diff.blk0
-                split_to_orig_map[b1] = diff.blk0
-                orig_to_split_map[diff.blk0] = (pre, b0, post)
-                orig_to_split_map[diff.blk1] = (pre_1, b1, post_1)
-            else:
-                b0 = diff.blk0
-            similar_blocks.append(b0)
-
-        return similar_blocks
-
-    # collect the difference in every graph
-    similar_graph_diffs = []
-    full_diffs = []
-    for blk0, blk1 in combinations(start_blocks, 2):
-        block_diffs = ail_graph_similarity(blk0, blk1, graph)
-        similar_graph_diffs.append(_similar_blocks_from_graph_diff(block_diffs))
-        full_diffs.append(block_diffs)
-
-    # find the lcs of the graph diffs
-    not_fixed = True
-    while not_fixed:
-        not_fixed = False
-        common_graph_diffs = list()
-
-        # stop once we only have one seq
-        if len(similar_graph_diffs) == 1:
-            break
-
-        # check each diff against the others
-        for graph_diff in similar_graph_diffs:
-            if graph_diff in common_graph_diffs:
-                continue
-
-            all_match = True
-            for other_diff in similar_graph_diffs:
-                # skip the same diff (not like similar)
-                if graph_diff is other_diff:
-                    continue
-
-                if len(graph_diff) > len(other_diff):
-                    all_match = False
-                    break
-
-                # iterate each block in each diff
-                for i, block in enumerate(graph_diff):
-                    # both the start and end can have a split
-                    if i == 0 or i == len(graph_diff)-1:
-                        if len(block.statements) > len(other_diff[i].statements):
-                            all_match = False
-                            break
-
-                        lcs, _ = lcs_ail_stmts([block, other_diff[i]], graph=graph)
-                        if not lcs:
-                            all_match = False
-                            break
-                    else:
-                        if not similar(block, other_diff[i]):
-                            all_match = False
-                            break
-
-            if all_match:
-                # assure no duplicates exist in set
-                for cgd in common_graph_diffs:
-                    if len(graph_diff) == len(cgd) and \
-                            all(similar(s1, s2, graph=graph) for s1, s2 in zip(graph_diff, cgd)):
-                        break
-                else:
-                    common_graph_diffs.append(graph_diff)
-                    not_fixed = True
-            else:
-                not_fixed = False
-
-        similar_graph_diffs = common_graph_diffs
-
-    # create the subgraph from the original graph
-    common_graph_diff = similar_graph_diffs[0]
-    common_graph_blocks = [blk for blk in common_graph_diff if graph.has_node(blk)]
-    split_blocks = [blk for blk in common_graph_diff if blk not in common_graph_blocks]
-    if not common_graph_blocks:
-        common_graph: nx.DiGraph = nx.DiGraph()
-        common_graph.add_nodes_from(split_blocks)
-    # needs correcting for split blocks
-    else:
-        common_graph = nx.subgraph(graph, common_graph_blocks)
-        common_graph = common_graph.copy()
-
-        for split_block in split_blocks:
-            og_block = split_to_orig_map[split_block]
-
-            # start with tail splits
-            if any(common_graph.has_node(pred) for pred in graph.predecessors(og_block)):
-                common_graph = replace_node(og_block, split_block, graph, common_graph, fix_successors=False)
-
-            # end with head splits
-            elif any(common_graph.has_node(succ) for succ in graph.successors(og_block)):
-                common_graph = replace_node(og_block, split_block, graph, common_graph, fix_predecessors=False)
-
-    # finally, find the start and ends of each splits
-    removable_blocks = set()
-    for diff in full_diffs:
-        for block_diff in diff:
-            removable_blocks.add(block_diff.blk0)
-            removable_blocks.add(block_diff.blk1)
-
-    return common_graph, orig_to_split_map, removable_blocks
 
 
 class MergeTarget:
@@ -894,17 +639,6 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
     else:
         return None
 
-    """
-    dominators = [idoms[node] for node in nodes]
-
-    for dom in dominators:
-        if isinstance(dom.statements[-1], ConditionalJump) and all(dominates(idoms, dom, node) for node in nodes):
-            return dom
-
-    return None
-    """
-
-
 def copy_cond_graph(merge_start_nodes, graph, idx=1):
     # [merge_node, nx.DiGraph: pre_graph]
     pre_graphs_maps = {}
@@ -1050,9 +784,17 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> \
             merge_targets[block] = MergeTarget({}, {}, {}, {}, removable_graph)
             continue
 
+        breakpoint()
+
         # create merge start association
-        pred_map = {og_to_split[block][0]: list(graph.predecessors(block))}
-        pre_block_map = {og_to_split[block][0]: block}
+        pred_map = {
+            (split[0] if split[0] else block): list(graph.predecessors(block))
+            for _, split in og_to_split.items()
+        }
+        pre_block_map = {
+            (split[0] if split[0] else block): block
+            for _, split in og_to_split.items()
+        }
 
         # create merge end association
         merge_end_to_og = {}
@@ -1111,6 +853,8 @@ class BlockMerger(OptimizationPass):
 
         self.exclusion_blocks = set()
         self.write_graph = self.simple_optimize_graph(self._graph)
+        #self.out_graph = self.write_graph
+        #return
 
         while True:
             if curr_depth >= allowed_depth:
