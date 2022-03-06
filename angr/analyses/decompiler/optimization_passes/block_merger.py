@@ -53,6 +53,260 @@ def find_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
 
     return block
 
+
+def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
+    split_map = {
+        block.addr: new_node for block, new_node in split_map_param.items()
+    }
+
+    graph = copy_graph_and_nodes(graph_param)
+    # this loop will continue to iterate until there are no more
+    # nodes found in the split_map to change
+    while True:
+        for node in graph.nodes():
+            # TODO: source of problems:
+            # now we are moddifying a block directly which is causing later analysis to get corrupted
+            # now happening because of the way we are grabbing statements
+            try:
+                new_node = split_map[node.addr]
+            except KeyError:
+                continue
+
+            break
+        else:
+            break
+
+        graph.add_node(new_node)
+        for pred in graph.predecessors(node):
+            last_stmt = pred.statements[-1]
+            pred.statements[-1] = correct_jump_targets(
+                last_stmt,
+                {node.addr: new_node.addr},
+                new_stmt=True
+            )
+
+            graph.add_edge(pred, new_node)
+
+        for succ in graph.successors(node):
+            graph.add_edge(new_node, succ)
+
+        graph.remove_node(node)
+
+    for node in graph.nodes():
+        last_stmt = node.statements[-1]
+        node.statements[-1] = correct_jump_targets(
+            last_stmt,
+            {orig_addr: new.addr for orig_addr, new in split_map.items()},
+            new_stmt=True
+        )
+
+    return graph
+
+
+def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_graph: nx.DiGraph,
+                 fix_successors=True, fix_predecessors=True) -> nx.DiGraph:
+
+    # get layout in the old graph
+    old_succ, old_preds = list(old_graph.successors(old_node)), list(old_graph.predecessors(old_node))
+
+    #
+    # Successors
+    #
+
+    if fix_successors:
+        if len(old_succ) == 1:
+            new_graph.add_edge(new_node, old_succ[0])
+        elif len(old_succ) == 2:
+            old_if_stmt: ConditionalJump = old_node.statements[-1]
+            new_if_stmt: ConditionalJump = new_node.statements[-1]
+
+            true_target = old_succ[0] if old_succ[0].addr == old_if_stmt.true_target.value \
+                else old_succ[1]
+            false_target = old_succ[1] if true_target != old_succ[1] \
+                else old_succ[0]
+
+            new_if_stmt.true_target.value = true_target.addr
+            new_if_stmt.true_target.value = false_target.addr
+
+            new_graph.add_edge(new_node, true_target)
+            new_graph.add_edge(new_node, false_target)
+        else:
+            new_graph.add_node(new_node)
+
+    #
+    # Predecessors
+    #
+
+    if fix_predecessors:
+        for pred in old_preds:
+            if isinstance(pred.statements[-1], ConditionalJump):
+                if_stmt = pred.statements[-1]
+                for attr in ["true_target", "false_target"]:
+                    target = getattr(if_stmt, attr)
+                    if target.value == old_node.addr:
+                        target.value = new_node.addr
+                        new_graph.add_edge(pred, new_node)
+            else:
+                new_graph.add_edge(pred, new_node)
+
+    if not fix_successors and not fix_predecessors:
+        new_graph.add_node(new_node)
+
+    return new_graph
+
+
+def bfs_list_blocks(start_block: Block, graph: nx.DiGraph):
+    blocks = []
+    bfs = list(nx.bfs_successors(graph, start_block, depth_limit=10))
+    for blk_tree in bfs:
+        source, children = blk_tree
+
+        if len(children) == 1:
+            blocks += children
+        elif len(children) == 2:
+            if_stmt: ConditionalJump = source.statements[-1]
+            if children[0].addr == if_stmt.true_target.value:
+                blocks += [children[0], children[1]]
+            else:
+                blocks += [children[1], children[0]]
+
+    blocks = [start_block] + blocks
+    return blocks
+
+
+def copy_graph_and_nodes(graph: nx.DiGraph) -> nx.DiGraph:
+    new_graph = networkx.DiGraph()
+    for node in graph.nodes:
+        new_graph.add_node(ail_block_from_stmts(node.statements, block_addr=node.addr))
+
+    for edge in graph.edges:
+        old_b0, old_b1 = edge
+        b0, b1 = find_block_by_addr(new_graph, old_b0.addr), find_block_by_addr(new_graph, old_b1.addr)
+        new_graph.add_edge(b0, b1)
+
+    return new_graph
+
+
+def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
+    """
+    Takes n nodes and returns True only if all the nodes are dominated by the same node, which must be
+    a ConditionalJump
+
+    @param nodes:
+    @param graph:
+    @return:
+    """
+    entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
+    idoms = nx.algorithms.immediate_dominators(graph, entry_blk)
+
+    node = nodes[0]
+    node_level = [node]
+    seen_nodes = set()
+    while node_level:
+        # check if any of the nodes on the current level are dominaters to all nodes
+        for cnode in node_level:
+            if isinstance(cnode.statements[-1], ConditionalJump) \
+                    and all(dominates(idoms, cnode, node) for node in nodes):
+                return cnode
+
+        # if no dominators found, move up a level
+        seen_nodes.update(set(node_level))
+        next_level = list(itertools.chain.from_iterable([list(graph.predecessors(cnode)) for cnode in node_level]))
+        # only add nodes we have never seen
+        node_level = set(next_level).difference(seen_nodes)
+
+    else:
+        return None
+
+
+def copy_cond_graph(merge_start_nodes, graph, idx=1):
+    # [merge_node, nx.DiGraph: pre_graph]
+    pre_graphs_maps = {}
+    # [merge_node, nx.DiGraph: full_graph]
+    graph_maps = {}
+    # [merge_node, removed_nodes]
+    removed_node_map = defaultdict(list)
+
+    # create a subgraph for every merge_start and the dom
+    shared_conditional_dom = shared_common_conditional_dom(merge_start_nodes, graph)
+    for merge_start in merge_start_nodes:
+        paths_between = nx.all_simple_paths(graph, source=shared_conditional_dom, target=merge_start)
+        nodes_between = {node for path in paths_between for node in path}
+        graph_maps[merge_start] = nx.subgraph(graph, nodes_between)
+
+    # create remove nodes for nodes that are shared among all graphs (conditional nodes)
+    for block0, graph0 in graph_maps.items():
+        for node in graph0.nodes:
+            for block1, graph1 in graph_maps.items():
+                if block0 == block1:
+                    continue
+
+                if node in graph1.nodes:
+                    removed_node_map[block0].append(node)
+
+    # make the pre-graph from removing the nodes
+    for block, blocks_graph in graph_maps.items():
+        pre_graph = blocks_graph.copy()
+        pre_graph.remove_nodes_from(removed_node_map[block])
+        pre_graphs_maps[block] = pre_graph
+
+    # make a conditional graph from any remove_nodes map (no deepcopy)
+    cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
+
+    # deep copy the graph and remove instructions that are not conditionals
+    new_cond_graph = nx.DiGraph()
+    orig_successors_by_insn = {
+        node.statements[-1].tags['ins_addr']: list(cond_graph.successors(node)) for node in cond_graph.nodes()
+    }
+    orig_nodes_by_insn = {
+        node.statements[-1].tags['ins_addr']: node for node in cond_graph.nodes()
+    }
+
+    # first pass: deepcopy all the nodes
+    for node in cond_graph.nodes():
+        # make the condition the only part of the node
+        new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(node.statements[-1], idx=idx)]))
+
+    # second pass: correct all the old edges
+    for node in new_cond_graph.nodes():
+        if_stmt = node.statements[-1]
+
+        # make new edges
+        old_sucs = orig_successors_by_insn[node.addr]
+        old_node = orig_nodes_by_insn[node.addr]
+        old_true = old_node.statements[-1].true_target.value
+        old_false = old_node.statements[-1].false_target.value
+        for old_suc in old_sucs:
+            new_suc = find_block_by_addr(new_cond_graph, old_suc.statements[-1].tags['ins_addr'])
+
+            # correct the conditional
+            if old_true == old_suc.addr:
+                if_stmt.true_target.value = new_suc.addr
+
+            if old_false == old_suc.addr:
+                if_stmt.false_target.value = new_suc.addr
+
+            # add the edge
+            new_cond_graph.add_edge(node, new_suc)
+
+    # correct edges that just go to code
+    for node in new_cond_graph.nodes:
+        if_stmt = node.statements[-1]
+        for attr in ["true_target", "false_target"]:
+            target = getattr(if_stmt, attr)
+            try:
+                curr_succ = find_block_by_addr(graph, target.value)
+            except Exception as e:
+                continue
+
+            for new_target, pre_graph in pre_graphs_maps.items():
+                if pre_graph.has_node(curr_succ):
+                    target.value = new_target.addr
+                    break
+
+    return new_cond_graph, pre_graphs_maps
+
+
 #
 # AIL Helpers
 #
@@ -112,7 +366,7 @@ def ail_block_from_stmts(stmts, idx=None, block_addr=None) -> Optional[Block]:
     return Block(
         first_stmt.tags['ins_addr'] if not block_addr else block_addr,
         0,
-        statements=stmts,
+        statements=[stmt for stmt in stmts],
         idx=idx or 1,
     )
 
@@ -126,6 +380,17 @@ def split_ail_block(block, split_idx, split_len) -> Tuple[Optional[Block], Optio
     post_split = ail_block_from_stmts(block.statements[split_idx + split_len:])
 
     return pre_split, merge_split, post_split
+
+
+def deepcopy_ail_jump(stmt: Jump, idx=1):
+    target: Const = stmt.target
+    tags = stmt.tags.copy()
+
+    return Jump(
+        idx,
+        Const(1, target.variable, target.value, target.bits, **target.tags.copy()),
+        **tags
+    )
 
 
 def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
@@ -142,23 +407,35 @@ def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
     )
 
 
-def copy_graph_and_nodes(graph: nx.DiGraph, new_nodes=False) -> nx.DiGraph:
-    new_graph = networkx.DiGraph()
-    for node in graph.nodes:
-        new_graph.add_node(ail_block_from_stmts(node.statements, block_addr=node.addr))
-        #new_graph.add_node(node.copy())
+def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=False):
+    if not replacement_map:
+        return stmt
 
-    for edge in graph.edges:
-        old_b0, old_b1 = edge
-        b0, b1 = find_block_by_addr(new_graph, old_b0.addr), find_block_by_addr(new_graph, old_b1.addr)
-        new_graph.add_edge(b0, b1)
+    if isinstance(stmt, ConditionalJump):
+        cond_stmt = deepcopy_ail_condjump(stmt) if new_stmt else stmt
+        true_target, false_target = cond_stmt.true_target, cond_stmt.false_target
 
-    return new_graph
+        if true_target.value in replacement_map:
+            true_target.value = replacement_map[true_target.value]
 
+        if false_target.value in replacement_map:
+            false_target.value = replacement_map[false_target.value]
+
+        return cond_stmt
+    elif isinstance(stmt, Jump):
+        jump_stmt = deepcopy_ail_jump(stmt) if new_stmt else stmt
+        target = jump_stmt.target
+
+        if target.value in replacement_map:
+            target.value = replacement_map[target.value]
+
+        return jump_stmt
+    else:
+        return stmt
 
 
 #
-# Longest Common Substring Helpers
+# Longest Common Substring Search Helpers/Functions
 #
 
 def _kmp_search_ail_obj(search_pattern, stmt_seq, graph=None, partial=True):
@@ -258,144 +535,9 @@ def longest_ail_graph_subseq(block_list, graph):
     return lcs
 
 
-def correct_conditional_jump(cond_stmt_param: ConditionalJump, replacement_map: Dict[int, int], new_stmt=False):
-    cond_stmt = deepcopy_ail_condjump(cond_stmt_param) if new_stmt else cond_stmt_param
-    true_target, false_target = cond_stmt.true_target, cond_stmt.false_target
-
-    if true_target.value in replacement_map:
-        true_target.value = replacement_map[true_target.value]
-
-    if false_target.value in replacement_map:
-        false_target.value = replacement_map[false_target.value]
-
-    return cond_stmt
-
-
-def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
-    split_map = {
-        block.addr: new_node for block, new_node in split_map_param.items()
-    }
-
-    graph = copy_graph_and_nodes(graph_param)
-    # this loop will continue to iterate until there are no more
-    # nodes found in the split_map to change
-    while True:
-        for node in graph.nodes():
-            # TODO: source of problems:
-            # now we are moddifying a block directly which is causing later analysis to get corrupted
-            # now happening because of the way we are grabbing statements
-            try:
-                new_node = split_map[node.addr]
-            except KeyError:
-                continue
-
-            break
-        else:
-            break
-
-        graph.add_node(new_node)
-        for pred in graph.predecessors(node):
-            last_stmt = pred.statements[-1]
-            if isinstance(last_stmt, ConditionalJump):
-                pred.statements[-1] = correct_conditional_jump(last_stmt, {node.addr: new_node.addr}, new_stmt=True)
-            elif isinstance(last_stmt, Jump):
-                pred.statements[-1].target.value = new_node.addr
-
-            graph.add_edge(pred, new_node)
-
-        for succ in graph.successors(node):
-            graph.add_edge(new_node, succ)
-
-        graph.remove_node(node)
-
-    for node in graph.nodes():
-        last_stmt = node.statements[-1]
-        if isinstance(last_stmt, ConditionalJump):
-            node.statements[-1] = correct_conditional_jump(
-                last_stmt, {orig_addr: new.addr for orig_addr, new in split_map.items()},
-                new_stmt=True
-            )
-
-    return graph
-
-
-def replace_node(old_node: Block, new_node: Block, old_graph: nx.DiGraph, new_graph: nx.DiGraph,
-                 fix_successors=True, fix_predecessors=True) -> nx.DiGraph:
-
-    # get layout in the old graph
-    old_succ, old_preds = list(old_graph.successors(old_node)), list(old_graph.predecessors(old_node))
-
-    #
-    # Successors
-    #
-
-    if fix_successors:
-        if len(old_succ) == 1:
-            new_graph.add_edge(new_node, old_succ[0])
-        elif len(old_succ) == 2:
-            old_if_stmt: ConditionalJump = old_node.statements[-1]
-            new_if_stmt: ConditionalJump = new_node.statements[-1]
-
-            true_target = old_succ[0] if old_succ[0].addr == old_if_stmt.true_target.value \
-                else old_succ[1]
-            false_target = old_succ[1] if true_target != old_succ[1] \
-                else old_succ[0]
-
-            new_if_stmt.true_target.value = true_target.addr
-            new_if_stmt.true_target.value = false_target.addr
-
-            new_graph.add_edge(new_node, true_target)
-            new_graph.add_edge(new_node, false_target)
-        else:
-            new_graph.add_node(new_node)
-
-    #
-    # Predecessors
-    #
-
-    if fix_predecessors:
-        for pred in old_preds:
-            if isinstance(pred.statements[-1], ConditionalJump):
-                if_stmt = pred.statements[-1]
-                for attr in ["true_target", "false_target"]:
-                    target = getattr(if_stmt, attr)
-                    if target.value == old_node.addr:
-                        target.value = new_node.addr
-                        new_graph.add_edge(pred, new_node)
-            else:
-                new_graph.add_edge(pred, new_node)
-
-    if not fix_successors and not fix_predecessors:
-        new_graph.add_node(new_node)
-
-    return new_graph
-
-
 def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_blocks=False):
-    all_blocks = []
-
-    # traverse all the blocks in BFS with True targets being first in children
-    for block in [block0, block1]:
-        blocks = list()
-        bfs = list(nx.bfs_successors(graph, block, depth_limit=10))
-
-        for blk_tree in bfs:
-            source, children = blk_tree
-
-            if len(children) == 1:
-                blocks += children
-            elif len(children) == 2:
-                if_stmt: ConditionalJump = source.statements[-1]
-                if children[0].addr == if_stmt.true_target.value:
-                    blocks += [children[0], children[1]]
-                else:
-                    blocks += [children[1], children[0]]
-
-        blocks = [block] + blocks
-        all_blocks.append(blocks)
-
-    b0_blocks = all_blocks[0]
-    b1_blocks = all_blocks[1]
+    b0_blocks = bfs_list_blocks(block0, graph)
+    b1_blocks = bfs_list_blocks(block1, graph)
     similarity = list()
 
     block_splits = {b: list() for b in [block0, block1]}
@@ -444,22 +586,7 @@ def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_b
 
 
 def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
-    traversal_blocks = list()
-    bfs = list(nx.bfs_successors(graph, orig_block, depth_limit=10))
-
-    for blk_tree in bfs:
-        source, children = blk_tree
-
-        if len(children) == 1:
-            traversal_blocks += children
-        elif len(children) == 2:
-            if_stmt: ConditionalJump = source.statements[-1]
-            if children[0].addr == if_stmt.true_target.value:
-                traversal_blocks += [children[0], children[1]]
-            else:
-                traversal_blocks += [children[1], children[0]]
-
-    traversal_blocks = [orig_block] + traversal_blocks
+    traversal_blocks = bfs_list_blocks(orig_block, graph)
 
     graph_sim = graph_similarity.copy()
     orig_blocks = list()
@@ -482,34 +609,8 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
     return orig_blocks, split_blocks
 
 
-class MergeTarget:
-    def __init__(self,
-                 predecessor_map: Dict[Block, List[Block]],
-                 pre_block_map: Dict[Block, Block],
-                 post_block_map: Dict[Block, Block],
-                 successor_map: Dict[Block, List[Block]],
-                 original_graph: nx.DiGraph
-                 ):
-        # [start_block, predecessor]
-        self.predecessor_map = predecessor_map
-        # [orig_block, pre_block]
-        self.pre_block_map = pre_block_map
-        # [end_block, post_block]
-        self.post_block_map = post_block_map
-        # [end_block, successor]
-        self.successor_map = successor_map
-        self.original_graph = original_graph
-
-    def __str__(self):
-        return f"<MergeTarget: {{\npreds[{self.predecessor_map}],\npre_blocks[{self.pre_block_map}],\n"\
-               f"post_blocks[{self.post_block_map}],\nsuccs[{self.successor_map}]\n}}"
-
-    def __repr__(self):
-        return str(self)
-
-
 #
-# Merger Optimization
+# Simple Optimizations
 #
 
 def remove_redundant_jumps(graph: nx.DiGraph):
@@ -537,10 +638,10 @@ def remove_redundant_jumps(graph: nx.DiGraph):
             remove_queue.append(block)
             for pred in graph.predecessors(block):
                 last_statement = pred.statements[-1]
-                if isinstance(last_statement, ConditionalJump):
-                    pred.statements[-1] = correct_conditional_jump(last_statement, {block.addr: succ.addr})
-                elif isinstance(last_statement, Jump):
-                    pred.statements[-1].target.value = succ.addr
+                pred.statements[-1] = correct_jump_targets(
+                    last_statement,
+                    {block.addr: succ.addr}
+                )
 
                 graph.add_edge(pred, succ)
             break
@@ -594,11 +695,10 @@ def remove_simple_similar_blocks(graph: nx.DiGraph):
 
             for pred in graph.predecessors(b1):
                 last_statement = pred.statements[-1]
-                if isinstance(last_statement, ConditionalJump):
-                    pred.statements[-1] = correct_conditional_jump(last_statement, {b1.addr: b0.addr})
-                elif isinstance(last_statement, Jump):
-                    pred.statements[-1].target.value = b0.addr
-
+                pred.statements[-1] = correct_jump_targets(
+                    last_statement,
+                    {b1.addr: b0.addr}
+                )
                 graph.add_edge(pred, b0)
 
             graph.remove_node(b1)
@@ -608,128 +708,37 @@ def remove_simple_similar_blocks(graph: nx.DiGraph):
     return graph, change
 
 
-def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
-    """
-    Takes n nodes and returns True only if all the nodes are dominated by the same node, which must be
-    a ConditionalJump
+#
+# Target Construction
+#
 
-    @param nodes:
-    @param graph:
-    @return:
-    """
-    entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
-    idoms = nx.algorithms.immediate_dominators(graph, entry_blk)
+class MergeTarget:
+    def __init__(self,
+                 predecessor_map: Dict[Block, List[Block]],
+                 pre_block_map: Dict[Block, Block],
+                 post_block_map: Dict[Block, Block],
+                 successor_map: Dict[Block, List[Block]],
+                 original_graph: nx.DiGraph
+                 ):
+        # [start_block, predecessor]
+        self.predecessor_map = predecessor_map
+        # [orig_block, pre_block]
+        self.pre_block_map = pre_block_map
+        # [end_block, post_block]
+        self.post_block_map = post_block_map
+        # [end_block, successor]
+        self.successor_map = successor_map
+        self.original_graph = original_graph
 
-    node = nodes[0]
-    node_level = [node]
-    seen_nodes = set()
-    while node_level:
-        # check if any of the nodes on the current level are dominaters to all nodes
-        for cnode in node_level:
-            if isinstance(cnode.statements[-1], ConditionalJump) \
-                    and all(dominates(idoms, cnode, node) for node in nodes):
-                return cnode
+    def __str__(self):
+        return f"<MergeTarget: {{\npreds[{self.predecessor_map}],\npre_blocks[{self.pre_block_map}],\n" \
+               f"post_blocks[{self.post_block_map}],\nsuccs[{self.successor_map}]\n}}"
 
-        # if no dominators found, move up a level
-        seen_nodes.update(set(node_level))
-        next_level = list(itertools.chain.from_iterable([list(graph.predecessors(cnode)) for cnode in node_level]))
-        # only add nodes we have never seen
-        node_level = set(next_level).difference(seen_nodes)
-
-    else:
-        return None
-
-def copy_cond_graph(merge_start_nodes, graph, idx=1):
-    # [merge_node, nx.DiGraph: pre_graph]
-    pre_graphs_maps = {}
-    # [merge_node, nx.DiGraph: full_graph]
-    graph_maps = {}
-    # [merge_node, removed_nodes]
-    removed_node_map = defaultdict(list)
-
-    # create a subgraph for every merge_start and the dom
-    shared_conditional_dom = shared_common_conditional_dom(merge_start_nodes, graph)
-    for merge_start in merge_start_nodes:
-        paths_between = nx.all_simple_paths(graph, source=shared_conditional_dom, target=merge_start)
-        nodes_between = {node for path in paths_between for node in path}
-        graph_maps[merge_start] = nx.subgraph(graph, nodes_between)
-
-    # create remove nodes for nodes that are shared among all graphs (conditional nodes)
-    for block0, graph0 in graph_maps.items():
-        for node in graph0.nodes:
-            for block1, graph1 in graph_maps.items():
-                if block0 == block1:
-                    continue
-
-                if node in graph1.nodes:
-                    removed_node_map[block0].append(node)
-
-    # make the pre-graph from removing the nodes
-    for block, blocks_graph in graph_maps.items():
-        pre_graph = blocks_graph.copy()
-        pre_graph.remove_nodes_from(removed_node_map[block])
-        pre_graphs_maps[block] = pre_graph
-
-    # make a conditional graph from any remove_nodes map (no deepcopy)
-    cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
-
-    # deep copy the graph and remove instructions that are not conditionals
-    new_cond_graph = nx.DiGraph()
-    orig_successors_by_insn = {
-        node.statements[-1].tags['ins_addr']: list(cond_graph.successors(node)) for node in cond_graph.nodes()
-    }
-    orig_nodes_by_insn = {
-        node.statements[-1].tags['ins_addr']: node for node in cond_graph.nodes()
-    }
-
-    # first pass: deepcopy all the nodes
-    for node in cond_graph.nodes():
-        # make the condition the only part of the node
-        new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(node.statements[-1], idx=idx)]))
-
-    # second pass: correct all the old edges
-    for node in new_cond_graph.nodes():
-        if_stmt = node.statements[-1]
-
-        # make new edges
-        old_sucs = orig_successors_by_insn[node.addr]
-        old_node = orig_nodes_by_insn[node.addr]
-        old_true = old_node.statements[-1].true_target.value
-        old_false = old_node.statements[-1].false_target.value
-        for old_suc in old_sucs:
-            new_suc = find_block_by_addr(new_cond_graph, old_suc.statements[-1].tags['ins_addr'])
-
-            # correct the conditional
-            if old_true == old_suc.addr:
-                if_stmt.true_target.value = new_suc.addr
-
-            if old_false == old_suc.addr:
-                if_stmt.false_target.value = new_suc.addr
-
-            # add the edge
-            new_cond_graph.add_edge(node, new_suc)
-
-    # correct edges that just go to code
-    #breakpoint()
-    for node in new_cond_graph.nodes:
-        if_stmt = node.statements[-1]
-        for attr in ["true_target", "false_target"]:
-            target = getattr(if_stmt, attr)
-            try:
-                curr_succ = find_block_by_addr(graph, target.value)
-            except Exception as e:
-                continue
-
-            for new_target, pre_graph in pre_graphs_maps.items():
-                if pre_graph.has_node(curr_succ):
-                    target.value = new_target.addr
-                    break
-
-    return new_cond_graph, pre_graphs_maps
+    def __repr__(self):
+        return str(self)
 
 
-def generate_merge_targets(blocks, graph: nx.DiGraph) -> \
-        Tuple[nx.DiGraph, Dict[int, MergeTarget]]:
+def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[Block, MergeTarget]]:
     """
     We locate the merge target graph as well as the places they differ.
     Consider merge graphs:
@@ -773,28 +782,29 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> \
             }
 
             merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
+            merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+            merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
 
             base_to_merge_end = {
-                og: merge_end
-                for og, merge_end in base_og_to_merge.items() if merge_end in merge_ends
+                og: merge_end for og, merge_end in zip(og_blocks, merge_blocks)
+                if merge_end in merge_ends
             }
-
-        if not og_to_split:
-            merge_targets[block] = MergeTarget({}, {}, {}, {}, removable_graph)
-            continue
-
-        breakpoint()
 
         # create merge start association
         pred_map = {
             (split[0] if split[0] else block): list(graph.predecessors(block))
             for _, split in og_to_split.items()
         }
+        if not pred_map:
+            pred_map = {block: list(graph.predecessors(block))}
+
         pre_block_map = {
             (split[0] if split[0] else block): block
             for _, split in og_to_split.items()
         }
+        if not pre_block_map:
+            pre_block_map = {block: block}
 
         # create merge end association
         merge_end_to_og = {}
@@ -810,6 +820,7 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> \
 
         post_block_map = {
             merge_end: og_to_split[og][2] for merge_end, og in merge_end_to_og.items()
+            if og in og_to_split and og_to_split[og][2]
         }
         succ_map = {
             merge_end: list(graph.successors(og)) for merge_end, og in merge_end_to_og.items()
@@ -904,30 +915,6 @@ class BlockMerger(OptimizationPass):
             self.write_graph.remove_nodes_from(removable_nodes)
             self.write_graph = nx.compose(self.write_graph, merge_graph)
 
-            # xxx: this can destroy things
-            for node in merge_graph.nodes:
-                last_stmt = node.statements[-1]
-                all_succ = [suc.addr for suc in self.write_graph.successors(node)]
-                if isinstance(last_stmt, ConditionalJump):
-                    for attr in ["true_target", "false_target"]:
-                        target = getattr(last_stmt, attr)
-                        if target.value in all_succ:
-                            continue
-
-                        try:
-                            new_succ = find_block_by_addr(self.write_graph, target.value)
-                        except Exception:
-                            continue
-
-                        self.write_graph.add_edge(node, new_succ)
-                elif isinstance(last_stmt, Jump):
-                    try:
-                        new_succ = find_block_by_addr(self.write_graph, target.value)
-                    except Exception:
-                        continue
-
-                    self.write_graph.add_edge(node, new_succ)
-
             #
             # 3: clone the conditional graph
             #
@@ -935,6 +922,11 @@ class BlockMerger(OptimizationPass):
             merge_end_to_cond_graph = {}
             # guarantees at least a single run
             for i, merge_end in enumerate(merge_ends):
+
+                # merge ends with no post blocks need no graph
+                if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
+                    continue
+
                 cond_graph, pre_graph_map = copy_cond_graph(candidate, self.read_graph, idx=i + 1)
                 root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
                 merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
@@ -945,18 +937,17 @@ class BlockMerger(OptimizationPass):
 
             for _, merge_target in merge_targets.items():
                 for pre_blk, old_blk in merge_target.pre_block_map.items():
-                    new_block = pre_blk if pre_blk else merge_start
+                    new_block = pre_blk if pre_blk != old_blk else merge_start
                     for pred in merge_target.predecessor_map[pre_blk]:
-                        if isinstance(pred.statements[-1], ConditionalJump):
-                            if_stmt: ConditionalJump = pred.statements[-1]
-                            for attr in ["true_target", "false_target"]:
-                                target = getattr(if_stmt, attr)
-                                if target.value == old_blk.addr:
-                                    target.value = new_block.addr
+                        last_statement = pred.statements[-1]
+                        pred.statements[-1] = correct_jump_targets(
+                            last_statement,
+                            {old_blk.addr: new_block.addr},
+                        )
 
                         self.write_graph.add_edge(pred, new_block)
 
-                    if pre_blk:
+                    if new_block == pre_blk:
                         self.write_graph.add_edge(pre_blk, merge_start)
             #
             # 5: make the merge graph ends point to conditional graph copies
@@ -976,16 +967,25 @@ class BlockMerger(OptimizationPass):
                 cond_root, cond_graph = cond_graph_info
 
                 for block, merge_target in merge_targets.items():
-                    post_blk = merge_target.post_block_map[merge_end]
-                    new_block = post_blk if post_blk else merge_target.successor_map[merge_end][0]
+                    try:
+                        new_block = merge_target.post_block_map[merge_end]
+                    except KeyError:
+                        new_block = merge_target.successor_map[merge_end][0] \
+                            if len(merge_target.successor_map[merge_end]) > 0 else None
+
+                    # skip conditionals that actually have no continuation
+                    if not new_block:
+                        continue
 
                     for cond in cond_graph.nodes:
-                        if_stmt: ConditionalJump = cond.statements[-1]
-                        for attr in ["true_target", "false_target"]:
-                            target = getattr(if_stmt, attr)
-                            if target.value == block.addr:
-                                target.value = new_block.addr
-                                self.write_graph.add_edge(cond, new_block)
+                        if_stmt = cond.statements[-1]
+                        cond.statements[-1] = correct_jump_targets(
+                            if_stmt,
+                            {block.addr: new_block.addr}
+                        )
+
+                        if new_block.addr in (if_stmt.true_target.value, if_stmt.false_target.value):
+                            self.write_graph.add_edge(cond, new_block)
             #
             # 7: make the post blocks continue to the next successors
             #
@@ -998,28 +998,48 @@ class BlockMerger(OptimizationPass):
                     for suc in merge_target.successor_map[merge_end]:
                         self.write_graph.add_edge(post_block, suc)
             #
-            # 8: fix the merge nodes
+            # 8: AD-HOC-FIX nodes that could've been modified (fixed point)
             #
-            breakpoint()
 
-            #breakpoint()
-            #for node in merge_graph.nodes:
-            #    last_statement = node.statements[-1]
-            #    if isinstance(last_statement, ConditionalJump):
-            #        if_stmt = node.statements[-1]
-            #        for attr in ["true_target", "false_target"]:
-            #            target = getattr(if_stmt, attr)
-            #            all_succ = [suc.addr for suc in self.write_graph.successors(node)]
+            while True:
+                new_nodes = []
+                for node in merge_graph.nodes:
+                    new_nodes += list(self.write_graph.predecessors(node))
+                    new_nodes += list(self.write_graph.successors(node))
+                modified_nodes = set(new_nodes)
 
-            #            if target.value in all_succ:
-            #                continue
+                for node in modified_nodes:
+                    updated = False
+                    # only attempt to fix nodes that end in a jump
+                    last_stmt = node.statements[-1]
+                    if isinstance(last_stmt, ConditionalJump):
+                        targets = [last_stmt.true_target.value, last_stmt.false_target.value]
+                    elif isinstance(last_stmt, Jump):
+                        targets = [last_stmt.target.value]
+                    else:
+                        continue
 
-            #            try:
-            #                new_succ = find_block_by_addr(self.write_graph, target.value)
-            #            except Exception:
-            #                continue
+                    # check if the jump targets of each node are present in all successors of node
+                    all_succ = [suc.addr for suc in self.write_graph.successors(node)]
+                    for value in targets:
+                        if value in all_succ:
+                            continue
 
-            #            self.write_graph.add_edge(node, new_succ)
+                        # if not, find that block, re-add it
+                        try:
+                            new_succ = find_block_by_addr(self.write_graph, value)
+                        except Exception:
+                            continue
+
+                        self.write_graph.add_edge(node, new_succ)
+                        updated = True
+                        break
+
+                    if updated:
+                        break
+
+                else:
+                    break
 
             self.write_graph = self.simple_optimize_graph(self.write_graph)
             break
@@ -1076,15 +1096,6 @@ class BlockMerger(OptimizationPass):
         # pairs. This will look like a graph diff having a block existent in its list of nodes.
         #
 
-        """
-        sim_list = {
-            (b0, b1): ail_graph_similarity(b0, b1, self.read_graph, only_blocks=True) for b0, b1 in candidates
-        }
-        blks_in_sim = {
-            (pair[0], pair[1]): set(itertools.chain.from_iterable([[sim[0], sim[1]] for sim in sims]))
-            for pair, sims in sim_list.items()
-        }
-        """
         blk_descendants = {
             (b0, b1): set(nx.descendants(self.read_graph, b0)).union(
                 set(nx.descendants(self.read_graph, b1)).union({b0, b1})
