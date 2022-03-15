@@ -14,6 +14,7 @@ from ailment.expression import Const, Register
 
 from ... import AnalysesHub
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
 from ..utils import to_ail_supergraph
 from ....utils.graph import dominates
 
@@ -58,17 +59,14 @@ def clone_graph_with_splits(graph_param: nx.DiGraph, split_map_param):
     split_map = {
         block.addr: new_node for block, new_node in split_map_param.items()
     }
-
     graph = copy_graph_and_nodes(graph_param)
     # this loop will continue to iterate until there are no more
     # nodes found in the split_map to change
     while True:
         for node in graph.nodes():
-            # TODO: source of problems:
-            # now we are moddifying a block directly which is causing later analysis to get corrupted
-            # now happening because of the way we are grabbing statements
             try:
                 new_node = split_map[node.addr]
+                del split_map[node.addr]
             except KeyError:
                 continue
 
@@ -261,13 +259,43 @@ def copy_cond_graph(merge_start_nodes, graph, idx=1):
     orig_nodes_by_insn = {
         node.statements[-1].tags['ins_addr']: node for node in cond_graph.nodes()
     }
+    conditionless_replacement = {}
 
     # first pass: deepcopy all the nodes
     for node in cond_graph.nodes():
-        # make the condition the only part of the node
-        new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(node.statements[-1], idx=idx)]))
+        last_statement = node.statements[-1]
 
-    # second pass: correct all the old edges
+        # non conditionals need to be replaced
+        if not isinstance(last_statement, ConditionalJump):
+            # this should only ever happen with single successor nodes
+            succ = list(cond_graph.successors(node))
+            assert len(succ) == 1
+            conditionless_replacement[node.addr] = succ[0].statements[-1].tags['ins_addr']
+            continue
+
+        # make the condition the only part of the node
+        new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(last_statement, idx=idx)]))
+
+    # second pass: correc edges left by jumps
+    for node in cond_graph.nodes():
+        last_statement = node.statements[-1]
+
+        # non conditionals need to be replaced
+        if not isinstance(last_statement, ConditionalJump):
+            continue
+
+        new_node = find_block_by_addr(new_cond_graph, last_statement.tags['ins_addr'], insn_addr=True)
+        if last_statement.true_target.value in conditionless_replacement:
+            new_target_value = conditionless_replacement[last_statement.true_target.value]
+            last_statement.true_target.value = new_target_value
+            new_cond_graph.add_edge(new_node, find_block_by_addr(new_cond_graph, new_target_value))
+
+        if last_statement.false_target.value in conditionless_replacement:
+            new_target_value = conditionless_replacement[last_statement.false_target.value]
+            last_statement.false_target.value = new_target_value
+            new_cond_graph.add_edge(new_node, find_block_by_addr(new_cond_graph, new_target_value))
+
+    # third pass: correct all the old edges
     for node in new_cond_graph.nodes():
         if_stmt = node.statements[-1]
 
@@ -676,7 +704,17 @@ def remove_simple_similar_blocks(graph: nx.DiGraph):
             if b0_suc != b1_suc:
                 continue
 
-            if not b0.likes(b1):
+            # special case: when we only have a single stmt
+            if len(b0.statements) == len(b1.statements) == 1:
+                try:
+                    is_similar = similar(b0, b1, graph=graph)
+                except Exception:
+                    continue
+
+                if not is_similar:
+                    continue
+
+            elif not b0.likes(b1):
                 continue
 
             remove_queue.append((b0, b1))
@@ -843,7 +881,7 @@ class BlockMerger(OptimizationPass):
     STAGE = OptimizationPassStage.AFTER_VARIABLE_RECOVERY
 
     def __init__(self, func, **kwargs):
-
+        self.region_identifier: RegionIdentifier = kwargs.pop("region_identifier")
         super().__init__(func, **kwargs)
 
         self.analyze()
@@ -868,6 +906,7 @@ class BlockMerger(OptimizationPass):
         #return
 
         while True:
+            print(f"=========================== RUNNING ANALYSIS ROUND {curr_depth} ===========================")
             if curr_depth >= allowed_depth:
                 raise Exception("Exceeded max depth allowed for duplication fixing")
 
@@ -883,17 +922,21 @@ class BlockMerger(OptimizationPass):
             candidates = self._find_initial_candidates()
             if not candidates:
                 print("There are no duplicate statements in this function")
-                return
+                break
 
             candidates = self._filter_candidates(candidates)
             if not candidates:
                 print("There are no duplicate blocks in this function")
-                return
+                break
+
 
             # do longest candidates first
             candidates = sorted(candidates, key=lambda x: len(x))
             candidate = candidates.pop()
             print(f"CANDIDATE FOUND: {candidate}")
+
+            check = self._share_subregion(candidate)
+            breakpoint()
 
             #
             # 1: locate the longest duplicate sequence in a graph and split it at the merge
@@ -906,6 +949,7 @@ class BlockMerger(OptimizationPass):
             ))
             merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+            breakpoint()
 
             #
             # 2: destroy the old blocks that will be merged and add the new merge graph
@@ -1042,7 +1086,6 @@ class BlockMerger(OptimizationPass):
                     break
 
             self.write_graph = self.simple_optimize_graph(self.write_graph)
-            break
 
         self.out_graph = self.write_graph
 
@@ -1050,11 +1093,59 @@ class BlockMerger(OptimizationPass):
     # Search Stages
     #
 
+    def _share_subregion(self, blocks: List[Block]) -> bool:
+        work_list = [self.region_identifier.region]
+        block_only_regions = []
+        seen_regions = set()
+        while work_list:
+            children_regions = []
+            for region in work_list:
+                children_blocks = []
+                for node in region.graph.nodes:
+                    if isinstance(node, Block):
+                        children_blocks.append(node.addr)
+                    elif isinstance(node, MultiNode):
+                        children_blocks += [n.addr for n in node.nodes]
+                    elif isinstance(node, GraphRegion):
+                        if node not in seen_regions:
+                            children_regions.append(node)
+                            seen_regions.add(node)
+                    else:
+                        continue
+
+                block_only_regions.append(children_blocks)
+
+            work_list = children_regions
+
+        breakpoint()
+
+        for region in block_only_regions:
+            if all(block.addr in region for block in blocks):
+                break
+        else:
+            return False
+
+        return True
+
+
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
-            if b0 in self.exclusion_blocks or b1 in self.exclusion_blocks:
-                continue
+            #if b0 in self.exclusion_blocks or b1 in self.exclusion_blocks:
+            #    continue
+            #if b0.addr in [0x4011d4, 0x4011fa] and b1.addr in [0x4011d4, 0x4011fa]:
+            #    breakpoint()
+
+            # special case: when we only have a single stmt
+            if len(b0.statements) == len(b1.statements) == 1:
+                try:
+                    is_similar = similar(b0, b1, graph=self.read_graph)
+                except Exception:
+                    continue
+
+                if is_similar:
+                    initial_candidates.append((b0, b1))
+                    continue
 
             # check if these nodes share any stmt in common
             stmt_in_common = False
