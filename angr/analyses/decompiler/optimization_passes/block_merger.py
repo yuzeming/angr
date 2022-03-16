@@ -4,6 +4,7 @@ import logging
 import copy
 from itertools import combinations
 import itertools
+from functools import cache
 
 import networkx
 import networkx as nx
@@ -684,66 +685,6 @@ def remove_redundant_jumps(graph: nx.DiGraph):
     return graph, change
 
 
-def remove_simple_similar_blocks(graph: nx.DiGraph):
-    """
-    Removes blocks that have all statements that are similar and the same successors
-    @param graph:
-    @return:
-    """
-    change = False
-    not_fixed = True
-    while not_fixed:
-        not_fixed = False
-        nodes = list(graph.nodes())
-        remove_queue = list()
-
-        for b0, b1 in itertools.combinations(nodes, 2):
-            b0_suc, b1_suc = set(graph.successors(b0)), set(graph.successors(b1))
-
-            # blocks should have the same successors
-            if b0_suc != b1_suc:
-                continue
-
-            # special case: when we only have a single stmt
-            if len(b0.statements) == len(b1.statements) == 1:
-                try:
-                    is_similar = similar(b0, b1, graph=graph)
-                except Exception:
-                    continue
-
-                if not is_similar:
-                    continue
-
-            elif not b0.likes(b1):
-                continue
-
-            remove_queue.append((b0, b1))
-            break
-
-        if not remove_queue:
-            break
-
-        print(f"REMOVING IN SIMPLE_DUP: {remove_queue}")
-        for b0, b1 in remove_queue:
-            if not (graph.has_node(b0) or graph.has_node(b1)):
-                continue
-
-            for suc in graph.successors(b1):
-                graph.add_edge(b0, suc)
-
-            for pred in graph.predecessors(b1):
-                last_statement = pred.statements[-1]
-                pred.statements[-1] = correct_jump_targets(
-                    last_statement,
-                    {b1.addr: b0.addr}
-                )
-                graph.add_edge(pred, b0)
-
-            graph.remove_node(b1)
-            not_fixed = True
-            change |= True
-
-    return graph, change
 
 
 #
@@ -903,7 +844,6 @@ class BlockMerger(OptimizationPass):
         self.exclusion_blocks = set()
         self.write_graph = self.simple_optimize_graph(self._graph)
         #self.out_graph = self.write_graph
-        #return
 
         while True:
             print(f"=========================== RUNNING ANALYSIS ROUND {curr_depth} ===========================")
@@ -914,6 +854,7 @@ class BlockMerger(OptimizationPass):
 
             # do all writes on write_graph and all reads on read_graph
             self.read_graph = self.write_graph.copy()
+
 
             #
             # 0: Find candidates with duplicated AIL statements
@@ -928,7 +869,6 @@ class BlockMerger(OptimizationPass):
             if not candidates:
                 print("There are no duplicate blocks in this function")
                 break
-
 
             # do longest candidates first
             candidates = sorted(candidates, key=lambda x: len(x))
@@ -1093,7 +1033,9 @@ class BlockMerger(OptimizationPass):
     # Search Stages
     #
 
-    def _share_subregion(self, blocks: List[Block]) -> bool:
+    @property
+    @cache
+    def _block_only_regions(self):
         work_list = [self.region_identifier.region]
         block_only_regions = []
         seen_regions = set()
@@ -1113,13 +1055,15 @@ class BlockMerger(OptimizationPass):
                     else:
                         continue
 
-                block_only_regions.append(children_blocks)
+                if children_blocks:
+                    block_only_regions.append(children_blocks)
 
             work_list = children_regions
 
-        breakpoint()
+        return block_only_regions
 
-        for region in block_only_regions:
+    def _share_subregion(self, blocks: List[Block]) -> bool:
+        for region in self._block_only_regions:
             if all(block.addr in region for block in blocks):
                 break
         else:
@@ -1127,14 +1071,12 @@ class BlockMerger(OptimizationPass):
 
         return True
 
-
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
-            #if b0 in self.exclusion_blocks or b1 in self.exclusion_blocks:
-            #    continue
-            #if b0.addr in [0x4011d4, 0x4011fa] and b1.addr in [0x4011d4, 0x4011fa]:
-            #    breakpoint()
+            # blocks must share a region
+            if not self._share_subregion([b0, b1]):
+                continue
 
             # special case: when we only have a single stmt
             if len(b0.statements) == len(b1.statements) == 1:
@@ -1271,6 +1213,70 @@ class BlockMerger(OptimizationPass):
     # Simple Optimizations (for cleanup)
     #
 
+    def remove_simple_similar_blocks(self, graph: nx.DiGraph):
+        """
+        Removes blocks that have all statements that are similar and the same successors
+        @param graph:
+        @return:
+        """
+        change = False
+        not_fixed = True
+        while not_fixed:
+            not_fixed = False
+            nodes = list(graph.nodes())
+            remove_queue = list()
+
+            for b0, b1 in itertools.combinations(nodes, 2):
+                if not self._share_subregion([b0, b1]):
+                    continue
+
+                b0_suc, b1_suc = set(graph.successors(b0)), set(graph.successors(b1))
+
+                # blocks should have the same successors
+                if b0_suc != b1_suc:
+                    continue
+
+                # special case: when we only have a single stmt
+                if len(b0.statements) == len(b1.statements) == 1:
+                    try:
+                        is_similar = similar(b0, b1, graph=graph)
+                    except Exception:
+                        continue
+
+                    if not is_similar:
+                        continue
+
+                elif not b0.likes(b1):
+                    continue
+
+                remove_queue.append((b0, b1))
+                break
+
+            if not remove_queue:
+                break
+
+            print(f"REMOVING IN SIMPLE_DUP: {remove_queue}")
+            for b0, b1 in remove_queue:
+                if not (graph.has_node(b0) or graph.has_node(b1)):
+                    continue
+
+                for suc in graph.successors(b1):
+                    graph.add_edge(b0, suc)
+
+                for pred in graph.predecessors(b1):
+                    last_statement = pred.statements[-1]
+                    pred.statements[-1] = correct_jump_targets(
+                        last_statement,
+                        {b1.addr: b0.addr}
+                    )
+                    graph.add_edge(pred, b0)
+
+                graph.remove_node(b1)
+                not_fixed = True
+                change |= True
+
+        return graph, change
+
     def simple_optimize_graph(self, graph):
         def _to_ail_supergraph(graph_):
             # make supergraph conversion always say no change
@@ -1280,7 +1286,7 @@ class BlockMerger(OptimizationPass):
         opts = [
             _to_ail_supergraph,
             remove_redundant_jumps,
-            remove_simple_similar_blocks
+            self.remove_simple_similar_blocks
         ]
 
         change = True
