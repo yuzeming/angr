@@ -444,10 +444,10 @@ def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=False):
         cond_stmt = deepcopy_ail_condjump(stmt) if new_stmt else stmt
         true_target, false_target = cond_stmt.true_target, cond_stmt.false_target
 
-        if true_target.value in replacement_map:
+        if isinstance(true_target, Const) and true_target.value in replacement_map:
             true_target.value = replacement_map[true_target.value]
 
-        if false_target.value in replacement_map:
+        if isinstance(false_target, Const) and false_target.value in replacement_map:
             false_target.value = replacement_map[false_target.value]
 
         return cond_stmt
@@ -455,7 +455,7 @@ def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=False):
         jump_stmt = deepcopy_ail_jump(stmt) if new_stmt else stmt
         target = jump_stmt.target
 
-        if target.value in replacement_map:
+        if isinstance(target, Const) and target.value in replacement_map:
             target.value = replacement_map[target.value]
 
         return jump_stmt
@@ -870,13 +870,10 @@ class BlockMerger(OptimizationPass):
                 print("There are no duplicate blocks in this function")
                 break
 
-            # do longest candidates first
             candidates = sorted(candidates, key=lambda x: len(x))
+            print(f"CANDIDATES FOUND: {candidates}")
             candidate = candidates.pop()
-            print(f"CANDIDATE FOUND: {candidate}")
-
-            check = self._share_subregion(candidate)
-            breakpoint()
+            print(f"CANDIDATE SELECTED: {candidate}")
 
             #
             # 1: locate the longest duplicate sequence in a graph and split it at the merge
@@ -889,7 +886,7 @@ class BlockMerger(OptimizationPass):
             ))
             merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
-            breakpoint()
+            #breakpoint()
 
             #
             # 2: destroy the old blocks that will be merged and add the new merge graph
@@ -1027,6 +1024,7 @@ class BlockMerger(OptimizationPass):
 
             self.write_graph = self.simple_optimize_graph(self.write_graph)
 
+        #breakpoint()
         self.out_graph = self.write_graph
 
     #
@@ -1074,6 +1072,10 @@ class BlockMerger(OptimizationPass):
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
+            # skip purposefully duplicated nodes
+            if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
+                continue
+
             # blocks must share a region
             if not self._share_subregion([b0, b1]):
                 continue
@@ -1207,6 +1209,11 @@ class BlockMerger(OptimizationPass):
             print(f"filtered now: {candidates}")
 
         candidates = list(set(candidates))
+        candidates = [
+            tuple(sorted(candidate, key=lambda x: x.addr)) for candidate in candidates
+        ]
+        candidates = sorted(candidates, key=lambda x: sum([c.addr for c in x]))
+
         return candidates
 
     #
