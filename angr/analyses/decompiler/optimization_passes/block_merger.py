@@ -197,6 +197,16 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
     """
     entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
     idoms = nx.algorithms.immediate_dominators(graph, entry_blk)
+    ancestors = {
+        node: list(nx.ancestors(graph, node)) for node in nodes
+    }
+
+    # no node for merging can be an ancestor to the other
+    for node in nodes:
+        other_ancestors = itertools.chain.from_iterable([ances for n, ances in ancestors.items() if n != node])
+        if node in other_ancestors:
+            return None
+
 
     node = nodes[0]
     node_level = [node]
@@ -205,7 +215,8 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
         # check if any of the nodes on the current level are dominaters to all nodes
         for cnode in node_level:
             if isinstance(cnode.statements[-1], ConditionalJump) \
-                    and all(dominates(idoms, cnode, node) for node in nodes):
+                    and all(dominates(idoms, cnode, node) for node in nodes) \
+                    and cnode not in nodes:
                 return cnode
 
         # if no dominators found, move up a level
@@ -1078,6 +1089,10 @@ class BlockMerger(OptimizationPass):
 
             # blocks must share a region
             if not self._share_subregion([b0, b1]):
+                continue
+
+            # must share a common dominator
+            if not shared_common_conditional_dom([b0, b1], self.read_graph):
                 continue
 
             # special case: when we only have a single stmt
