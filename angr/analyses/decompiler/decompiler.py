@@ -119,6 +119,14 @@ class Decompiler(Analysis):
         self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri)
         self._update_progress(75., text='Structuring code')
 
+        # run block merger optimization
+        from .optimization_passes.block_merger import BlockMerger
+        bm = BlockMerger(self.func, graph=clinic.graph, region_identifier=ri)
+        self.clinic.graph = bm.out_graph if bm.out_graph else clinic.graph
+        self.clinic.cc_graph = self.clinic._copy_graph()
+        ri = self.project.analyses.RegionIdentifier(self.func, graph=clinic.graph, cond_proc=cond_proc, kb=self.kb)
+        self._update_progress(79., text='Deduplicating blocks')
+
         # structure it
         rs = self.project.analyses.RecursiveStructurer(ri.region, cond_proc=cond_proc, kb=self.kb, func=self.func)
         self._update_progress(80., text='Simplifying regions')
