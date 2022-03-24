@@ -197,6 +197,7 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
     """
     entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
     idoms = nx.algorithms.immediate_dominators(graph, entry_blk)
+    """
     ancestors = {
         node: list(nx.ancestors(graph, node)) for node in nodes
     }
@@ -205,8 +206,8 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
     for node in nodes:
         other_ancestors = itertools.chain.from_iterable([ances for n, ances in ancestors.items() if n != node])
         if node in other_ancestors:
-            return None
-
+          return None
+    """
 
     node = nodes[0]
     node_level = [node]
@@ -998,6 +999,7 @@ class BlockMerger(OptimizationPass):
                 for node in merge_graph.nodes:
                     new_nodes += list(self.write_graph.predecessors(node))
                     new_nodes += list(self.write_graph.successors(node))
+                    new_nodes += [node]
                 modified_nodes = set(new_nodes)
 
                 for node in modified_nodes:
