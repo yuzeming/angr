@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import List, Tuple, Optional, Dict, Set
+from typing import List, Tuple, Optional, Dict, Set, Union
 import logging
 import copy
 from itertools import combinations
@@ -209,6 +209,11 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
           return None
     """
 
+    # first check if any of the node pairs could be a dominating loop
+    for b0, b1 in itertools.combinations(nodes, 2):
+        if dominates(idoms, b0, b1) or dominates(idoms, b0, b1):
+            return None
+
     node = nodes[0]
     node_level = [node]
     seen_nodes = set()
@@ -262,90 +267,50 @@ def copy_cond_graph(merge_start_nodes, graph, idx=1):
         pre_graphs_maps[block] = pre_graph
 
     # make a conditional graph from any remove_nodes map (no deepcopy)
-    cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
+    temp_cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
 
-    # deep copy the graph and remove instructions that are not conditionals
-    new_cond_graph = nx.DiGraph()
+    # deep copy the graph and remove instructions that are not control flow altering
+    cond_graph = nx.DiGraph()
     orig_successors_by_insn = {
-        node.statements[-1].tags['ins_addr']: list(cond_graph.successors(node)) for node in cond_graph.nodes()
+        node.statements[-1].tags['ins_addr']: list(temp_cond_graph.successors(node)) for node in temp_cond_graph.nodes()
     }
     orig_nodes_by_insn = {
-        node.statements[-1].tags['ins_addr']: node for node in cond_graph.nodes()
+        node.statements[-1].tags['ins_addr']: node for node in temp_cond_graph.nodes()
     }
     conditionless_replacement = {}
 
-    # first pass: deepcopy all the nodes
-    for node in cond_graph.nodes():
-        last_statement = node.statements[-1]
+    #XXX: EXPERIMENTAL CODE:
+    block_to_insn_map = {
+        node.addr: node.statements[-1].tags['ins_addr'] for node in temp_cond_graph.nodes()
+    }
+    for merge_start in merge_start_nodes:
+        for node in pre_graphs_maps[merge_start].nodes:
+            block_to_insn_map[node.addr] = merge_start.addr
 
-        # non conditionals need to be replaced
-        if not isinstance(last_statement, ConditionalJump):
-            # this should only ever happen with single successor nodes
-            succ = list(cond_graph.successors(node))
-            assert len(succ) == 1
-            conditionless_replacement[node.addr] = succ[0].statements[-1].tags['ins_addr']
-            continue
+    # deepcopy every node in the conditional graph with a unique address
+    crafted_blocks = {}
+    for edge in temp_cond_graph.edges:
+        new_edge = ()
+        for block in edge:
+            last_stmt = block.statements[-1]
 
-        # make the condition the only part of the node
-        new_cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_condjump(last_statement, idx=idx)]))
-
-    # second pass: correc edges left by jumps
-    for node in cond_graph.nodes():
-        last_statement = node.statements[-1]
-
-        # non conditionals need to be replaced
-        if not isinstance(last_statement, ConditionalJump):
-            continue
-
-        new_node = find_block_by_addr(new_cond_graph, last_statement.tags['ins_addr'], insn_addr=True)
-        if last_statement.true_target.value in conditionless_replacement:
-            new_target_value = conditionless_replacement[last_statement.true_target.value]
-            last_statement.true_target.value = new_target_value
-            new_cond_graph.add_edge(new_node, find_block_by_addr(new_cond_graph, new_target_value))
-
-        if last_statement.false_target.value in conditionless_replacement:
-            new_target_value = conditionless_replacement[last_statement.false_target.value]
-            last_statement.false_target.value = new_target_value
-            new_cond_graph.add_edge(new_node, find_block_by_addr(new_cond_graph, new_target_value))
-
-    # third pass: correct all the old edges
-    for node in new_cond_graph.nodes():
-        if_stmt = node.statements[-1]
-
-        # make new edges
-        old_sucs = orig_successors_by_insn[node.addr]
-        old_node = orig_nodes_by_insn[node.addr]
-        old_true = old_node.statements[-1].true_target.value
-        old_false = old_node.statements[-1].false_target.value
-        for old_suc in old_sucs:
-            new_suc = find_block_by_addr(new_cond_graph, old_suc.statements[-1].tags['ins_addr'])
-
-            # correct the conditional
-            if old_true == old_suc.addr:
-                if_stmt.true_target.value = new_suc.addr
-
-            if old_false == old_suc.addr:
-                if_stmt.false_target.value = new_suc.addr
-
-            # add the edge
-            new_cond_graph.add_edge(node, new_suc)
-
-    # correct edges that just go to code
-    for node in new_cond_graph.nodes:
-        if_stmt = node.statements[-1]
-        for attr in ["true_target", "false_target"]:
-            target = getattr(if_stmt, attr)
             try:
-                curr_succ = find_block_by_addr(graph, target.value)
-            except Exception as e:
-                continue
+                new_block = crafted_blocks[block.addr]
+            except KeyError:
+                new_block = ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)])
+                crafted_blocks[block.addr] = new_block
 
-            for new_target, pre_graph in pre_graphs_maps.items():
-                if pre_graph.has_node(curr_succ):
-                    target.value = new_target.addr
-                    break
+            new_edge += (new_block, )
+        cond_graph.add_edge(*new_edge)
 
-    return new_cond_graph, pre_graphs_maps
+    # correct every jump target
+    for node in cond_graph.nodes:
+        node.statements[-1] = correct_jump_targets(
+            node.statements[-1],
+            block_to_insn_map
+        )
+
+    return cond_graph, pre_graphs_maps
 
 
 #
@@ -446,6 +411,16 @@ def deepcopy_ail_condjump(stmt: ConditionalJump, idx=1):
         Const(1, false_target.variable, false_target.value, false_target.bits, **false_target.tags.copy()),
         **tags
     )
+
+
+def deepcopy_ail_anyjump(stmt: Union[Jump, ConditionalJump], idx=1):
+    if isinstance(stmt, Jump):
+        return deepcopy_ail_jump(stmt, idx=idx)
+    elif isinstance(stmt, ConditionalJump):
+        return deepcopy_ail_condjump(stmt, idx=idx)
+    else:
+        raise Exception("Attempting to deepcopy non-jump stmt, likely happen to a "
+                        "block ending in no jump. Place a jump there to fix it.")
 
 
 def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=False):
@@ -850,23 +825,21 @@ class BlockMerger(OptimizationPass):
         """
         Entry analysis routine that will trigger the other analysis stages
         """
-        allowed_depth = 10
-        curr_depth = 0
+        max_iters = 10
+        curr_iter = 0
 
         self.exclusion_blocks = set()
         self.write_graph = self.simple_optimize_graph(self._graph)
         #self.out_graph = self.write_graph
 
         while True:
-            print(f"=========================== RUNNING ANALYSIS ROUND {curr_depth} ===========================")
-            if curr_depth >= allowed_depth:
-                raise Exception("Exceeded max depth allowed for duplication fixing")
-
-            curr_depth += 1
+            curr_iter += 1
+            print(f"=========================== RUNNING ANALYSIS ROUND {curr_iter} ===========================")
+            if curr_iter >= max_iters:
+                raise Exception("Exceeded max iterations allowed for duplication fixing")
 
             # do all writes on write_graph and all reads on read_graph
             self.read_graph = self.write_graph.copy()
-
 
             #
             # 0: Find candidates with duplicated AIL statements
@@ -898,7 +871,6 @@ class BlockMerger(OptimizationPass):
             ))
             merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
-            #breakpoint()
 
             #
             # 2: destroy the old blocks that will be merged and add the new merge graph
@@ -913,6 +885,7 @@ class BlockMerger(OptimizationPass):
             #
 
             merge_end_to_cond_graph = {}
+            common_node_addr = shared_common_conditional_dom(candidate, self.read_graph).statements[-1].tags['ins_addr']
             # guarantees at least a single run
             for i, merge_end in enumerate(merge_ends):
 
@@ -920,8 +893,13 @@ class BlockMerger(OptimizationPass):
                 if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
                     continue
 
-                cond_graph, pre_graph_map = copy_cond_graph(candidate, self.read_graph, idx=i + 1)
-                root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
+                cond_graph, pre_graph_map = copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
+                try:
+                    root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
+                except IndexError:
+                    print("This duplication is in a looping condition, using a node estimate")
+                    root_cond = find_block_by_addr(cond_graph, common_node_addr)
+
                 merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
 
             #
@@ -971,13 +949,14 @@ class BlockMerger(OptimizationPass):
                         continue
 
                     for cond in cond_graph.nodes:
-                        if_stmt = cond.statements[-1]
+                        last_stmt = cond.statements[-1]
                         cond.statements[-1] = correct_jump_targets(
-                            if_stmt,
+                            last_stmt,
                             {block.addr: new_block.addr}
                         )
 
-                        if new_block.addr in (if_stmt.true_target.value, if_stmt.false_target.value):
+                        if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value))\
+                                or (isinstance(last_stmt, Jump) and new_block.addr == last_stmt.target.value):
                             self.write_graph.add_edge(cond, new_block)
             #
             # 7: make the post blocks continue to the next successors
