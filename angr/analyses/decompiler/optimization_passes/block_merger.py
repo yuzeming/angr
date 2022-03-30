@@ -271,15 +271,7 @@ def copy_cond_graph(merge_start_nodes, graph, idx=1):
 
     # deep copy the graph and remove instructions that are not control flow altering
     cond_graph = nx.DiGraph()
-    orig_successors_by_insn = {
-        node.statements[-1].tags['ins_addr']: list(temp_cond_graph.successors(node)) for node in temp_cond_graph.nodes()
-    }
-    orig_nodes_by_insn = {
-        node.statements[-1].tags['ins_addr']: node for node in temp_cond_graph.nodes()
-    }
-    conditionless_replacement = {}
 
-    #XXX: EXPERIMENTAL CODE:
     block_to_insn_map = {
         node.addr: node.statements[-1].tags['ins_addr'] for node in temp_cond_graph.nodes()
     }
