@@ -795,10 +795,15 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[
 
 
 class BlockMerger(OptimizationPass):
+    """
+    Merges blocks
+    """
 
     ARCHES = ['AMD64', 'ARMEL', 'ARMHF', "ARMCortexM", ]
     PLATFORMS = ["cgc", "linux"]
     STAGE = OptimizationPassStage.AFTER_VARIABLE_RECOVERY
+    NAME = "Block Merger"
+    DESCRIPTION = __doc__.strip()
 
     def __init__(self, func, **kwargs):
         self.region_identifier: RegionIdentifier = kwargs.pop("region_identifier")
