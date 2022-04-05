@@ -295,6 +295,12 @@ def copy_cond_graph(merge_start_nodes, graph, idx=1):
             new_edge += (new_block, )
         cond_graph.add_edge(*new_edge)
 
+    # graphs with no edges but only nodes
+    if len(list(cond_graph.nodes)) == 0:
+        for node in temp_cond_graph.nodes:
+            last_stmt = node.statements[-1]
+            cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)]))
+
     # correct every jump target
     for node in cond_graph.nodes:
         node.statements[-1] = correct_jump_targets(
@@ -604,6 +610,12 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
             break
 
         lcs, lcs_idxs = longest_ail_subseq([block.statements, graph_sim[:len(block.statements)]], graph=graph)
+        if block is orig_block:
+            #breakpoint()
+            lcs_1, lcs_idxs_1 = longest_ail_subseq([graph_sim[:len(block.statements)], block.statements], graph=graph)
+            if lcs_idxs_1[1] > lcs_idxs[0]:
+                lcs, lcs_idxs = lcs_1, lcs_idxs_1[::-1]
+
         if not lcs:
             break
 
@@ -742,6 +754,7 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[
             merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
             merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+            #breakpoint()
             merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
 
             base_to_merge_end = {
@@ -890,6 +903,7 @@ class BlockMerger(OptimizationPass):
                 if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
                     continue
 
+                #breakpoint()
                 cond_graph, pre_graph_map = copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
                 try:
                     root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
@@ -1097,7 +1111,8 @@ class BlockMerger(OptimizationPass):
                     continue
 
                 for stmt1 in b1.statements:
-                    if stmt0.likes(stmt1):
+                    # XXX: used to be just likes()
+                    if similar(stmt0, stmt1, self.read_graph):
                         stmt_in_common = True
                         break
 
