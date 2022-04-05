@@ -343,7 +343,10 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
             # must use graph to know
             for attr in ["true_target", "false_target"]:
                 t1, t2 = getattr(ail_obj1, attr).value, getattr(ail_obj2, attr).value
-                t1_blk, t2_blk = find_block_by_addr(graph, t1), find_block_by_addr(graph, t2)
+                try:
+                    t1_blk, t2_blk = find_block_by_addr(graph, t1), find_block_by_addr(graph, t2)
+                except Exception:
+                    return False
 
                 # skip full checks when partial checking is on
                 if partial and t1_blk.statements[0].likes(t2_blk.statements[0]):
