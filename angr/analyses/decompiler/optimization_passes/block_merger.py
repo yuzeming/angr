@@ -1055,6 +1055,7 @@ class BlockMerger(OptimizationPass):
                     elif isinstance(node, GraphRegion):
                         if node not in seen_regions:
                             children_regions.append(node)
+                            children_blocks.append(node.head.addr)
                             seen_regions.add(node)
                     else:
                         continue
@@ -1078,6 +1079,7 @@ class BlockMerger(OptimizationPass):
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
+            # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
             if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
                 continue
