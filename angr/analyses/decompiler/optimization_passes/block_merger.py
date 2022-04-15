@@ -4,7 +4,6 @@ import logging
 import copy
 from itertools import combinations
 import itertools
-from functools import cache
 
 import networkx
 import networkx as nx
@@ -1038,7 +1037,6 @@ class BlockMerger(OptimizationPass):
     #
 
     @property
-    @cache
     def _block_only_regions(self):
         work_list = [self.region_identifier.region]
         block_only_regions = []
