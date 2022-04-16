@@ -234,82 +234,6 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
         return None
 
 
-def copy_cond_graph(merge_start_nodes, graph, idx=1):
-    # [merge_node, nx.DiGraph: pre_graph]
-    pre_graphs_maps = {}
-    # [merge_node, nx.DiGraph: full_graph]
-    graph_maps = {}
-    # [merge_node, removed_nodes]
-    removed_node_map = defaultdict(list)
-
-    # create a subgraph for every merge_start and the dom
-    shared_conditional_dom = shared_common_conditional_dom(merge_start_nodes, graph)
-    for merge_start in merge_start_nodes:
-        paths_between = nx.all_simple_paths(graph, source=shared_conditional_dom, target=merge_start)
-        nodes_between = {node for path in paths_between for node in path}
-        graph_maps[merge_start] = nx.subgraph(graph, nodes_between)
-
-    # create remove nodes for nodes that are shared among all graphs (conditional nodes)
-    for block0, graph0 in graph_maps.items():
-        for node in graph0.nodes:
-            for block1, graph1 in graph_maps.items():
-                if block0 == block1:
-                    continue
-
-                if node in graph1.nodes:
-                    removed_node_map[block0].append(node)
-
-    # make the pre-graph from removing the nodes
-    for block, blocks_graph in graph_maps.items():
-        pre_graph = blocks_graph.copy()
-        pre_graph.remove_nodes_from(removed_node_map[block])
-        pre_graphs_maps[block] = pre_graph
-
-    # make a conditional graph from any remove_nodes map (no deepcopy)
-    temp_cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
-
-    # deep copy the graph and remove instructions that are not control flow altering
-    cond_graph = nx.DiGraph()
-
-    block_to_insn_map = {
-        node.addr: node.statements[-1].tags['ins_addr'] for node in temp_cond_graph.nodes()
-    }
-    for merge_start in merge_start_nodes:
-        for node in pre_graphs_maps[merge_start].nodes:
-            block_to_insn_map[node.addr] = merge_start.addr
-
-    # deepcopy every node in the conditional graph with a unique address
-    crafted_blocks = {}
-    for edge in temp_cond_graph.edges:
-        new_edge = ()
-        for block in edge:
-            last_stmt = block.statements[-1]
-
-            try:
-                new_block = crafted_blocks[block.addr]
-            except KeyError:
-                new_block = ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)])
-                crafted_blocks[block.addr] = new_block
-
-            new_edge += (new_block, )
-        cond_graph.add_edge(*new_edge)
-
-    # graphs with no edges but only nodes
-    if len(list(cond_graph.nodes)) == 0:
-        for node in temp_cond_graph.nodes:
-            last_stmt = node.statements[-1]
-            cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)]))
-
-    # correct every jump target
-    for node in cond_graph.nodes:
-        node.statements[-1] = correct_jump_targets(
-            node.statements[-1],
-            block_to_insn_map
-        )
-
-    return cond_graph, pre_graphs_maps
-
-
 #
 # AIL Helpers
 #
@@ -906,7 +830,7 @@ class BlockMerger(OptimizationPass):
                     continue
 
                 #breakpoint()
-                cond_graph, pre_graph_map = copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
+                cond_graph, pre_graph_map = self.copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
                 try:
                     root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
                 except IndexError:
@@ -1036,6 +960,87 @@ class BlockMerger(OptimizationPass):
     # Search Stages
     #
 
+    def copy_cond_graph(self, merge_start_nodes, graph, idx=1):
+        # [merge_node, nx.DiGraph: pre_graph]
+        pre_graphs_maps = {}
+        # [merge_node, nx.DiGraph: full_graph]
+        graph_maps = {}
+        # [merge_node, removed_nodes]
+        removed_node_map = defaultdict(list)
+
+        # create a subgraph for every merge_start and the dom
+        shared_conditional_dom = shared_common_conditional_dom(merge_start_nodes, graph)
+        for merge_start in merge_start_nodes:
+            paths_between = nx.all_simple_paths(graph, source=shared_conditional_dom, target=merge_start)
+            nodes_between = {node for path in paths_between for node in path}
+            graph_maps[merge_start] = nx.subgraph(graph, nodes_between)
+
+        # create remove nodes for nodes that are shared among all graphs (conditional nodes)
+        for block0, graph0 in graph_maps.items():
+            for node in graph0.nodes:
+                for block1, graph1 in graph_maps.items():
+                    if block0 == block1:
+                        continue
+
+                    if node in graph1.nodes:
+                        removed_node_map[block0].append(node)
+
+        # make the pre-graph from removing the nodes
+        for block, blocks_graph in graph_maps.items():
+            pre_graph = blocks_graph.copy()
+            pre_graph.remove_nodes_from(removed_node_map[block])
+            pre_graphs_maps[block] = pre_graph
+
+        # make a conditional graph from any remove_nodes map (no deepcopy)
+        temp_cond_graph: nx.DiGraph = nx.subgraph(graph, removed_node_map[merge_start_nodes[0]])
+
+        # deep copy the graph and remove instructions that are not control flow altering
+        cond_graph = nx.DiGraph()
+
+        block_to_insn_map = {
+            node.addr: node.statements[-1].tags['ins_addr'] for node in temp_cond_graph.nodes()
+        }
+        for merge_start in merge_start_nodes:
+            for node in pre_graphs_maps[merge_start].nodes:
+                block_to_insn_map[node.addr] = merge_start.addr
+
+        # fix nodes that don't end in a jump
+        for node in temp_cond_graph:
+            successors = list(temp_cond_graph.successors(node))
+            if not isinstance(node.statements[-1], (ConditionalJump, Jump)) and len(successors) == 1:
+                node.statements += [Jump(None, Const(None, None, successors[0].addr, self.project.arch.bits), ins_addr=successors[0].addr)]
+
+        # deepcopy every node in the conditional graph with a unique address
+        crafted_blocks = {}
+        for edge in temp_cond_graph.edges:
+            new_edge = ()
+            for block in edge:
+                last_stmt = block.statements[-1]
+
+                try:
+                    new_block = crafted_blocks[block.addr]
+                except KeyError:
+                    new_block = ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)])
+                    crafted_blocks[block.addr] = new_block
+
+                new_edge += (new_block,)
+            cond_graph.add_edge(*new_edge)
+
+        # graphs with no edges but only nodes
+        if len(list(cond_graph.nodes)) == 0:
+            for node in temp_cond_graph.nodes:
+                last_stmt = node.statements[-1]
+                cond_graph.add_node(ail_block_from_stmts([deepcopy_ail_anyjump(last_stmt, idx=idx)]))
+
+        # correct every jump target
+        for node in cond_graph.nodes:
+            node.statements[-1] = correct_jump_targets(
+                node.statements[-1],
+                block_to_insn_map
+            )
+
+        return cond_graph, pre_graphs_maps
+
     @property
     def _block_only_regions(self):
         work_list = [self.region_identifier.region]
@@ -1155,12 +1160,20 @@ class BlockMerger(OptimizationPass):
                 if candidate in removal_queue:
                     continue
 
-                for pair, descendants in blk_descendants.items():
-                    if pair == candidate:
+                stop = False
+                for candidate2 in candidates:
+                    if candidate2 == candidate or candidate2 not in blk_descendants:
                         continue
 
+                    descendants = blk_descendants[candidate2]
                     if all(c in descendants for c in candidate):
                         removal_queue.append(candidate)
+                        del blk_descendants[candidate]
+                        stop = True
+                        break
+
+                if stop:
+                    break
 
             if len(removal_queue) == 0:
                 break
