@@ -120,8 +120,7 @@ class Decompiler(Analysis):
         self._update_progress(75., text='Structuring code')
 
         # run block merger optimization
-        from .optimization_passes.block_merger import BlockMerger
-        bm = BlockMerger(self.func, graph=clinic.graph, region_identifier=ri)
+        bm = self.project.analyses.BlockMerger(self.func, graph=clinic.graph, region_identifier=ri)
         self.clinic.graph = bm.out_graph if bm.out_graph else clinic.graph
         self.clinic.cc_graph = self.clinic._copy_graph()
         ri = self.project.analyses.RegionIdentifier(self.func, graph=clinic.graph, cond_proc=cond_proc, kb=self.kb)
