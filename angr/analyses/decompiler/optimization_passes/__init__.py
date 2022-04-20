@@ -28,7 +28,7 @@ _all_optimization_passes = [
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
     (BlockMerger, True),
-    (EagerReturnsSimplifier, True),
+    (EagerReturnsSimplifier, False),
 ]
 
 def get_optimization_passes(arch, platform):
