@@ -27,7 +27,7 @@ _all_optimization_passes = [
     (ConstantDereferencesSimplifier, True),
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
-    (BlockMerger, True)
+    (BlockMerger, True),
     (EagerReturnsSimplifier, True),
 ]
 
