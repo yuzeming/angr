@@ -738,9 +738,9 @@ class BlockMerger(OptimizationPass):
     Merges blocks
     """
 
-    ARCHES = ['AMD64', 'ARMEL', 'ARMHF', "ARMCortexM", ]
+    ARCHES = ["X86", "AMD64", "ARMCortexM", "ARMHF", "ARMEL", ]
     PLATFORMS = ["cgc", "linux"]
-    STAGE = OptimizationPassStage.AFTER_VARIABLE_RECOVERY
+    STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Block Merger"
     DESCRIPTION = __doc__.strip()
 
