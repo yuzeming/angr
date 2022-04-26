@@ -449,6 +449,7 @@ class Clinic(Analysis):
             stack_arg_offsets=stack_arg_offsets,
             ail_manager=self._ail_manager,
         )
+        self.rd = simp._reaching_definitions
         # the function graph has been updated at this point
         return simp.simplified
 

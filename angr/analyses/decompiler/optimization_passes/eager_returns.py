@@ -42,7 +42,8 @@ class EagerReturnsSimplifier(OptimizationPass):
                  # settings
                  max_level=2,
                  min_indegree=2,
-                 region_identifier=None):
+                 region_identifier=None,
+                 rd=None):
 
         super().__init__(func, blocks_by_addr=blocks_by_addr, blocks_by_addr_and_idx=blocks_by_addr_and_idx,
                          graph=graph)
