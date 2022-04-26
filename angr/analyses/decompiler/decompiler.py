@@ -116,7 +116,7 @@ class Decompiler(Analysis):
         # recover regions
         ri = self.project.analyses.RegionIdentifier(self.func, graph=clinic.graph, cond_proc=cond_proc, kb=self.kb)
         # run optimizations that may require re-RegionIdentification
-        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri)
+        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri, clinic.rd)
         self.clinic.cc_graph = self.clinic._copy_graph()
         self._update_progress(75., text='Structuring code')
 
@@ -144,7 +144,7 @@ class Decompiler(Analysis):
         self.cache.clinic = self.clinic
 
     @timethis
-    def _run_region_simplification_passes(self, ail_graph, ri):
+    def _run_region_simplification_passes(self, ail_graph, ri, rd):
         """
         Runs optimizations that should be executed after a single region identification. This function will return
         two items: the new RegionIdentifier object and the new AIL Graph, which should probably be written
@@ -177,13 +177,14 @@ class Decompiler(Analysis):
 
             analysis = getattr(self.project.analyses, pass_.__name__)
             a = analysis(self.func, blocks_by_addr=addr_to_blocks, blocks_by_addr_and_idx=addr_and_idx_to_blocks,
-                         graph=ail_graph, region_identifier=ri)
+                         graph=ail_graph, region_identifier=ri, rd=rd)
 
             # should be None if no changes
             if a.out_graph:
                 # use the new graph
                 ail_graph = a.out_graph
                 # always update RI on graph change
+                cond_proc = ConditionProcessor(self.project.arch)
                 ri = self.project.analyses.RegionIdentifier(self.func, graph=ail_graph, cond_proc=cond_proc,
                                                             kb=self.kb)
 

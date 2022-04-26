@@ -537,7 +537,6 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
 
         lcs, lcs_idxs = longest_ail_subseq([block.statements, graph_sim[:len(block.statements)]], graph=graph)
         if block is orig_block:
-            #breakpoint()
             lcs_1, lcs_idxs_1 = longest_ail_subseq([graph_sim[:len(block.statements)], block.statements], graph=graph)
             if lcs_idxs_1[1] > lcs_idxs[0]:
                 lcs, lcs_idxs = lcs_1, lcs_idxs_1[::-1]
@@ -746,6 +745,7 @@ class BlockMerger(OptimizationPass):
 
     def __init__(self, func, **kwargs):
         self.region_identifier: RegionIdentifier = kwargs.pop("region_identifier")
+        self.rd = kwargs.pop("rd")
         super().__init__(func, **kwargs)
 
         self.analyze()
