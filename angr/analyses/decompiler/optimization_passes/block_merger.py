@@ -743,9 +743,9 @@ class BlockMerger(OptimizationPass):
     NAME = "Block Merger"
     DESCRIPTION = __doc__.strip()
 
-    def __init__(self, func, **kwargs):
-        self.region_identifier: RegionIdentifier = kwargs.pop("region_identifier")
-        self.rd = kwargs.pop("rd")
+    def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
+        self.region_identifier = region_identifier
+        self.rd = reaching_definitions
         super().__init__(func, **kwargs)
 
         self.analyze()
