@@ -116,8 +116,7 @@ class Decompiler(Analysis):
         # recover regions
         ri = self.project.analyses.RegionIdentifier(self.func, graph=clinic.graph, cond_proc=cond_proc, kb=self.kb)
         # run optimizations that may require re-RegionIdentification
-        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri, clinic.rd)
-        self.clinic.cc_graph = self.clinic._copy_graph()
+        self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri, clinic.reaching_definitions)
         self._update_progress(75., text='Structuring code')
 
         # structure it
@@ -144,7 +143,7 @@ class Decompiler(Analysis):
         self.cache.clinic = self.clinic
 
     @timethis
-    def _run_region_simplification_passes(self, ail_graph, ri, rd):
+    def _run_region_simplification_passes(self, ail_graph, ri, reaching_definitions):
         """
         Runs optimizations that should be executed after a single region identification. This function will return
         two items: the new RegionIdentifier object and the new AIL Graph, which should probably be written
@@ -155,9 +154,9 @@ class Decompiler(Analysis):
 
         @param ail_graph:   DiGraph with AIL Statements
         @param ri:          RegionIdentifier
+        @param reaching_defenitions: ReachingDefenitionAnalysis
         @return:            The possibly new AIL DiGraph and RegionIdentifier
         """
-        cond_proc = ri.cond_proc
         addr_and_idx_to_blocks: Dict[Tuple[int, Optional[int]], ailment.Block] = {}
         addr_to_blocks: Dict[int, Set[ailment.Block]] = defaultdict(set)
 
@@ -177,14 +176,15 @@ class Decompiler(Analysis):
 
             analysis = getattr(self.project.analyses, pass_.__name__)
             a = analysis(self.func, blocks_by_addr=addr_to_blocks, blocks_by_addr_and_idx=addr_and_idx_to_blocks,
-                         graph=ail_graph, region_identifier=ri, rd=rd)
+                         graph=ail_graph, region_identifier=ri, reaching_definitions=reaching_definitions)
 
             # should be None if no changes
             if a.out_graph:
                 # use the new graph
                 ail_graph = a.out_graph
-                # always update RI on graph change
+
                 cond_proc = ConditionProcessor(self.project.arch)
+                # always update RI on graph change
                 ri = self.project.analyses.RegionIdentifier(self.func, graph=ail_graph, cond_proc=cond_proc,
                                                             kb=self.kb)
 
