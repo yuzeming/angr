@@ -45,7 +45,7 @@ class TestRunEcho(unittest.TestCase):
 
         bingo_count = 0
         for s in simgr.deadended:
-            bingo_count += int("Bingo" in s.posix.dumps(1).decode())
+            bingo_count += int(b"Bingo" in s.posix.dumps(1))
 
         assert bingo_count == 1
 
@@ -61,7 +61,7 @@ class TestRunEcho(unittest.TestCase):
 
         solved_flag = []
         for s in simgr.deadended:
-            if "Bingo" in s.posix.dumps(1).decode():
+            if b"Bingo" in s.posix.dumps(1):
                 solved_flag.append(s.solver.eval(flag,cast_to=bytes).strip(b'\x00') )
 
         assert len(solved_flag) == 1
