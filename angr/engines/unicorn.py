@@ -36,8 +36,8 @@ class SimEngineUnicorn(SuccessorsMixin):
 
         if uc_module is None or _UC_NATIVE is None:
             if once('unicorn_install_warning'):
-                l.error("You are attempting to use unicorn engine support even though it or the angr native layer "
-                        "isn't installed")
+                l.debug("You are attempting to use unicorn engine support even "
+                    "though it or the angr native layer isn't installed")
             return False
 
         self.__countdown(state)

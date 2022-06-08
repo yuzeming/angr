@@ -25,11 +25,18 @@ from .plugin import SimStatePlugin
 l = logging.getLogger(name=__name__)
 ffi = cffi.FFI()
 
+
 try:
     import unicorn
+    if unicorn.__version__ != "1.0.2":
+        raise RuntimeError("Unicorn version 1.0.2 is required, but you have %s" % unicorn.__version__)
 except ImportError:
-    l.warning("Unicorn is not installed. Support disabled.")
+    l.debug("Unicorn is not installed. Support disabled.")
     unicorn = None
+except RuntimeError as e:
+    l.warning("Unicorn is installed, but doesn't match requirement. Support disabled.", e)
+    unicorn = None
+
 
 class MEM_PATCH(ctypes.Structure):
     """
