@@ -1,7 +1,6 @@
 from collections import defaultdict
 from typing import List, Tuple, Optional, Dict, Set, Union
 import logging
-import copy
 from itertools import combinations
 import itertools
 
@@ -954,7 +953,7 @@ class BlockMerger(OptimizationPass):
             self.write_graph = self.simple_optimize_graph(self.write_graph)
 
         #breakpoint()
-        self.out_graph = self.write_graph
+        self.out_graph = self.write_graph #self.remove_simple_similar_blocks(self.write_graph)
 
     #
     # Search Stages
@@ -1317,7 +1316,6 @@ class BlockMerger(OptimizationPass):
         opts = [
             _to_ail_supergraph,
             remove_redundant_jumps,
-            self.remove_simple_similar_blocks
         ]
 
         change = True
