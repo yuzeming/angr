@@ -154,8 +154,7 @@ class Decompiler(Analysis):
         # run optimizations that may require re-RegionIdentification
         self.clinic.graph, ri = self._run_region_simplification_passes(clinic.graph, ri, clinic.reaching_definitions,
                                                                        ite_exprs=ite_exprs)
-
-        self.clinic.cc_graph = self.clinic._copy_graph()
+        self.clinic.cc_graph = self.clinic.copy_graph()
         self._update_progress(75., text='Structuring code')
 
         # structure it
