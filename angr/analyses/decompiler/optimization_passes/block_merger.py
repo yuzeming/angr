@@ -558,48 +558,83 @@ def ail_similarity_to_orig_blocks(orig_block, graph_similarity, graph):
 #
 
 def remove_redundant_jumps(graph: nx.DiGraph):
+    """
+    This can destroy ConditionalJumps with 2 successors but only one is a real target
+
+    @param graph:
+    @return:
+    """
     change = False
     while True:
-        remove_queue = list()
-        for block in graph.nodes:
-            if len(block.statements) != 1:
+        for target_blk in graph.nodes:
+            if not target_blk.statements:
                 continue
 
-            stmt = block.statements[0]
-            if not isinstance(stmt, (Jump, ConditionalJump)):
+            # must end in a jump of some sort
+            last_stmt = target_blk.statements[-1]
+            if not isinstance(last_stmt, (Jump, ConditionalJump)):
                 continue
 
-            succs = list(graph.successors(block))
-            if len(succs) <= 0:
+            # nodes that end in a jump and have more than a single stmt are actually
+            # just normal stmts that end in a jump
+            if isinstance(last_stmt, Jump) and len(target_blk.statements) > 1:
                 continue
 
-            # skip real ConditionalJumps (ones with two different true/false target)
-            if isinstance(stmt, ConditionalJump):
-                if len(succs) == 2 and stmt.true_target.value != stmt.false_target.value:
-                    continue
+            # must have successors otherwise we could be remove a final jump out of the function
+            target_successors = list(graph.successors(target_blk))
+            if not target_successors:
+                continue
 
-            succ = succs[0]
-            remove_queue.append(block)
-            for pred in graph.predecessors(block):
-                last_statement = pred.statements[-1]
+            if isinstance(last_stmt, ConditionalJump):
+                if len(target_successors) == 2:
+                    # skip real ConditionalJumps (ones with two different true/false target)
+                    if last_stmt.true_target.value != last_stmt.false_target.value:
+                        continue
+
+                    # XXX: removed for now
+                    # two successors, verify one is outdated and one matches the true_target value
+                    # which gauntnees we can remove the other
+                    if last_stmt.true_target.value not in [succ.addr for succ in target_successors]:
+                        continue
+                    
+                    # remove the outdated successor edge
+                    outdated_blk = [blk for blk in target_blk if blk.addr != last_stmt.true_target.value][0]
+
+                    graph.remove_edge(target_blk, outdated_blk)
+                    print(f"REMOVING EDGE IN SIMPLE_REDUNDANT: {(target_blk, outdated_blk)}")
+                    # restart the search because we fixed edges
+                    change |= True
+                    break
+
+            # At this point we have two situation:
+            # - a single stmt node ending in a Jump
+            # - a (possibly) multi-stmt node ending in a conditional Jump w/ 1 successor
+            successor = target_successors[0]
+
+            # In the case of the conditional jump with multiple statements before the jump, we just transfer this
+            # block's statements over to the next block, excluding the jump
+            if len(target_blk.statements) > 1:
+                successor.statements = target_blk.statements[:-1] + successor.statements
+
+            # All the predecessors need to now point to the successor of the node that is about to be removed
+            for pred in graph.predecessors(target_blk):
+                last_pred_stmt = pred.statements[-1]
                 pred.statements[-1] = correct_jump_targets(
-                    last_statement,
-                    {block.addr: succ.addr}
+                    last_pred_stmt,
+                    {target_blk.addr: successor.addr}
                 )
+                graph.add_edge(pred, successor)
 
-                graph.add_edge(pred, succ)
+            graph.remove_node(target_blk)
+            print(f"REMOVING NODE IN SIMPLE_REDUNDANT: {target_blk}")
+            change |= True
             break
-
-        if not remove_queue:
+        else:
+            # Finishing the loop without every breaking out of the loop means we did not change
+            # anything in this iteration, which means we hit the Fixedpoint
             break
-
-        print(f"REMOVING IN SIMPLE_REDUNDANT_JUMP: {remove_queue}")
-        graph.remove_nodes_from(remove_queue)
-        change |= True
 
     return graph, change
-
-
 
 
 #
@@ -918,9 +953,10 @@ class BlockMerger(OptimizationPass):
                 modified_nodes = set(new_nodes)
 
                 for node in modified_nodes:
+                    last_stmt = node.statements[-1]
+
                     updated = False
                     # only attempt to fix nodes that end in a jump
-                    last_stmt = node.statements[-1]
                     if isinstance(last_stmt, ConditionalJump):
                         targets = [last_stmt.true_target.value, last_stmt.false_target.value]
                     elif isinstance(last_stmt, Jump):
@@ -1314,8 +1350,8 @@ class BlockMerger(OptimizationPass):
 
         new_graph = graph.copy()
         opts = [
-            _to_ail_supergraph,
             remove_redundant_jumps,
+            _to_ail_supergraph,
         ]
 
         change = True
