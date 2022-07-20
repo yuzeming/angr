@@ -14,6 +14,9 @@ from angr.analyses import (
     Decompiler,
 )
 from angr.analyses.decompiler.optimization_passes.expr_op_swapper import OpDescriptor
+from angr.analyses.decompiler.refactor_passes import CascadingIfToNestedIf, ConditionNodeSwapScopes, MergeNestedIfs
+from angr.analyses.decompiler.structurer_node_path import NodePath, ConditionNodeChildren
+from angr.analyses.decompiler.structurer_nodes import SequenceNode, ConditionNode
 
 test_location = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'binaries', 'tests')
 l = logging.Logger(__name__)
@@ -752,6 +755,59 @@ class TestDecompiler(unittest.TestCase):
         assert "{}" not in code, "Found empty code blocks in decompilation output. This may indicate some " \
                                  "assignments are incorrectly removed."
         assert '"o"' in code and '"x"' in code, "CFG failed to recognize single-byte strings."
+
+    def test_decompiling_amp_challenge03_arm_rx_brake_routine(self):
+        bin_path = os.path.join(test_location, "armhf", "decompiler", "challenge_03")
+        p = angr.Project(bin_path, auto_load_libs=False)
+
+        cfg = p.analyses[CFGFast].prep()(data_references=True, normalize=True)
+        p.analyses[CompleteCallingConventionsAnalysis].prep()(recover_variables=True)
+        func = cfg.functions[0x400cc5]
+
+        # disable eager returns simplifier
+        all_optimization_passes = angr.analyses.decompiler.optimization_passes.get_default_optimization_passes("ARMHF",
+                                                                                                               "linux")
+        all_optimization_passes = [ p for p in all_optimization_passes
+                                    if p is not angr.analyses.decompiler.optimization_passes.EagerReturnsSimplifier ]
+
+        refactor_vector = [
+            (NodePath([(SequenceNode, 1)]), (CascadingIfToNestedIf, None)),
+            (NodePath([(SequenceNode, 1)]), (ConditionNodeSwapScopes, None)),
+            (NodePath([(SequenceNode, 1), (ConditionNode, ConditionNodeChildren.TrueNode)]), (MergeNestedIfs, None)),
+        ]
+        dec = p.analyses[Decompiler].prep()(func, cfg=cfg.model, optimization_passes=all_optimization_passes,
+                                            refactor_vector=refactor_vector)
+        assert dec.codegen is not None, "Failed to decompile function %r." % func
+        self._print_decompilation_result(dec)
+
+        # the decompiled code should look like this:
+        #
+        #     if (!(a1[5] != 0))
+        #     {
+        #         if (v1 > 0 && a1[4] == 0)
+        #         {
+        #             a1[6] = 1;
+        #         }
+        #     }
+        #     else
+        #     {
+        #         a1[6] = 0;
+        #         a1[4] = 0;
+        #     }
+        #
+        code = dec.codegen.text
+        lines = [ line.strip(" ") for line in code.split("\n") ]
+
+        # find the first if
+        first_if_lineno, first_if_line = None, None
+        for lineno, line in enumerate(lines):
+            if first_if_lineno is None:
+                if "if " in line:
+                    first_if_lineno = lineno
+                    first_if_line = line
+        second_if = lines[first_if_lineno + 2]
+        assert "if " in second_if
+        assert " && " in second_if
 
     def test_decompiling_amp_challenge03_arm_expr_swapping(self):
         bin_path = os.path.join(test_location, "armhf", "decompiler", "challenge_03")
