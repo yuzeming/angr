@@ -193,7 +193,11 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
     @param graph:
     @return:
     """
-    entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
+    try:
+        entry_blk = [node for node in graph.nodes if graph.in_degree(node) == 0][0]
+    except IndexError:
+        return None
+
     idoms = nx.algorithms.immediate_dominators(graph, entry_blk)
     """
     ancestors = {
