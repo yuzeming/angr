@@ -30,7 +30,6 @@ _all_optimization_passes = [
     (ConstantDereferencesSimplifier, True),
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
-    (EagerReturnsSimplifier, True),
     (ITEExprConverter, True),
     (ExprOpSwapper, True),
     (CallArgSimplifier, True),
