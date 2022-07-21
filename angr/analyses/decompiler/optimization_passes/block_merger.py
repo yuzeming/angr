@@ -770,6 +770,10 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[
     return merge_graph, merge_targets
 
 
+#
+# Main Analysis
+#
+
 class BlockMerger(OptimizationPass):
     """
     Merges blocks

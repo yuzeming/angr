@@ -199,4 +199,5 @@ class CallArgSimplifier(OptimizationPass):
 
         return True
 
+
 AnalysesHub.register_default("CallArgSimplifier", CallArgSimplifier)
