@@ -11,10 +11,11 @@ from ailment.block import Block
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment
 from ailment.expression import Const, Register
 
-from ... import AnalysesHub
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
+from ....analyses.reaching_definitions.reaching_definitions import ReachingDefinitionsAnalysis
 from ..utils import to_ail_supergraph
+from ... import AnalysesHub
 from ....utils.graph import dominates
 
 
@@ -590,11 +591,13 @@ def remove_redundant_jumps(graph: nx.DiGraph):
                 continue
 
             if isinstance(last_stmt, ConditionalJump):
+                if len(target_successors) > 2:
+                    print("WARNING: incorrect amount of successors found for node in redundant_jumps")
+
                 if len(target_successors) == 2:
                     # skip real ConditionalJumps (ones with two different true/false target)
                     if last_stmt.true_target.value != last_stmt.false_target.value:
                         continue
-
                     # XXX: removed for now
                     # two successors, verify one is outdated and one matches the true_target value
                     # which gauntnees we can remove the other
@@ -786,8 +789,8 @@ class BlockMerger(OptimizationPass):
     DESCRIPTION = __doc__.strip()
 
     def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
-        self.region_identifier = region_identifier
-        self.rd = reaching_definitions
+        self.ri: RegionIdentifier = region_identifier
+        self.rd: ReachingDefinitionsAnalysis = reaching_definitions
         super().__init__(func, **kwargs)
 
         self.analyze()
@@ -871,7 +874,6 @@ class BlockMerger(OptimizationPass):
                 if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
                     continue
 
-                #breakpoint()
                 cond_graph, pre_graph_map = self.copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
                 try:
                     root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
@@ -897,7 +899,8 @@ class BlockMerger(OptimizationPass):
 
                         self.write_graph.add_edge(pred, new_block)
 
-                    if new_block == pre_blk:
+                    # XXX: this can be dangerous when fixing loops since we can stop a loop from being recreated
+                    if new_block == pre_blk and pre_blk != merge_start:
                         self.write_graph.add_edge(pre_blk, merge_start)
             #
             # 5: make the merge graph ends point to conditional graph copies
@@ -995,6 +998,10 @@ class BlockMerger(OptimizationPass):
                     break
 
             self.write_graph = self.simple_optimize_graph(self.write_graph)
+            self._update_subregions(
+                set(node.addr for node in removable_nodes),
+                set(node.addr for node in merge_graph.nodes)
+            )
 
         #breakpoint()
         self.out_graph = self.write_graph #self.remove_simple_similar_blocks(self.write_graph)
@@ -1083,38 +1090,24 @@ class BlockMerger(OptimizationPass):
             )
 
         return cond_graph, pre_graphs_maps
+    
+    def _update_subregions(self, updated_addrs, new_addrs):
+        #for region in self.ri.regions_by_block_addrs:
+        #    if any(addr in region for addr in updated_addrs):
+        #        for new_addr in new_addrs:
+        #            region.append(new_addr)
+        ## make each index has a list of unique addrs
+        #for i in range(len(self.ri.regions_by_block_addrs)):
+        #    self.ri.regions_by_block_addrs[i] = list(set(self.ri.regions_by_block_addrs[i]))
 
-    @property
-    def _block_only_regions(self):
-        work_list = [self.region_identifier.region]
-        block_only_regions = []
-        seen_regions = set()
-        while work_list:
-            children_regions = []
-            for region in work_list:
-                children_blocks = []
-                for node in region.graph.nodes:
-                    if isinstance(node, Block):
-                        children_blocks.append(node.addr)
-                    elif isinstance(node, MultiNode):
-                        children_blocks += [n.addr for n in node.nodes]
-                    elif isinstance(node, GraphRegion):
-                        if node not in seen_regions:
-                            children_regions.append(node)
-                            children_blocks.append(node.head.addr)
-                            seen_regions.add(node)
-                    else:
-                        continue
+        # refresh RegionIdentifier
+        self.ri = self.project.analyses.RegionIdentifier(
+            self.ri.function, cond_proc=self.ri.cond_proc, graph=self.write_graph
+        )
 
-                if children_blocks:
-                    block_only_regions.append(children_blocks)
-
-            work_list = children_regions
-
-        return block_only_regions
-
+    
     def _share_subregion(self, blocks: List[Block]) -> bool:
-        for region in self._block_only_regions:
+        for region in self.ri.regions_by_block_addrs:
             if all(block.addr in region for block in blocks):
                 break
         else:
@@ -1125,10 +1118,14 @@ class BlockMerger(OptimizationPass):
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
+            if all(b.addr in [0x40123f, 0x4011d6] for b in [b0, b1]):
+                #breakpoint()
+                pass
+
             # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
-            if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
-                continue
+            #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
+            #    continue
 
             # blocks must share a region
             if not self._share_subregion([b0, b1]):

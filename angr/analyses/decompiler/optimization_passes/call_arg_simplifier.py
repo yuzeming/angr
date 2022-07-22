@@ -27,7 +27,7 @@ class CallArgSimplifier(OptimizationPass):
     DESCRIPTION = __doc__.strip()
 
     def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
-        self.region_identifier = region_identifier
+        self.ri = region_identifier
         self.rd = reaching_definitions
         super().__init__(func, **kwargs)
 
@@ -160,38 +160,8 @@ class CallArgSimplifier(OptimizationPass):
 
         return False
 
-
-    @property
-    def _block_only_regions(self):
-        work_list = [self.region_identifier.region]
-        block_only_regions = []
-        seen_regions = set()
-        while work_list:
-            children_regions = []
-            for region in work_list:
-                children_blocks = []
-                for node in region.graph.nodes:
-                    if isinstance(node, Block):
-                        children_blocks.append(node.addr)
-                    elif isinstance(node, MultiNode):
-                        children_blocks += [n.addr for n in node.nodes]
-                    elif isinstance(node, GraphRegion):
-                        if node not in seen_regions:
-                            children_regions.append(node)
-                            children_blocks.append(node.head.addr)
-                            seen_regions.add(node)
-                    else:
-                        continue
-
-                if children_blocks:
-                    block_only_regions.append(children_blocks)
-
-            work_list = children_regions
-
-        return block_only_regions
-
     def _share_subregion(self, blocks: List[Block]) -> bool:
-        for region in self._block_only_regions:
+        for region in self.ri.regions_by_block_addrs:
             if all(block.addr in region for block in blocks):
                 break
         else:
