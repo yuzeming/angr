@@ -1,5 +1,5 @@
 from itertools import chain
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 import logging
 
 import archinfo
@@ -15,6 +15,8 @@ from ...storage.memory_mixins.paged_memory.pages.multi_values import MultiValues
 from ...knowledge_plugins.key_definitions.atoms import Register, Tmp, MemoryLocation
 from ...knowledge_plugins.key_definitions.constants import OP_BEFORE, OP_AFTER
 from ...knowledge_plugins.key_definitions.live_definitions import Definition, LiveDefinitions
+from ...knowledge_plugins.functions import Function
+from ...analyses.reaching_definitions.call_trace import CallTrace
 from .subject import SubjectType
 from .external_codeloc import ExternalCodeLocation
 from .rd_state import ReachingDefinitionsState
@@ -91,9 +93,16 @@ class SimEngineRDAIL(
     # Private methods
     #
 
-    @staticmethod
-    def _external_codeloc():
-        return ExternalCodeLocation()
+    def _generate_call_string(self) -> Tuple[int, ...]:
+        if isinstance(self.state._subject.content, Function):
+            return (self.state._subject.content.addr,)
+        elif isinstance(self.state._subject.content, CallTrace):
+            return tuple(x.caller_func_addr for x in self.state._subject.content.callsites)
+        else:
+            return None
+
+    def _external_codeloc(self):
+        return ExternalCodeLocation(self._generate_call_string())
 
     #
     # AIL statement handlers
