@@ -288,7 +288,7 @@ class ReachingDefinitionsState:
                         # initialize stack parameters
                         elif isinstance(arg, SimStackArg):
                             ml_atom = MemoryLocation(SpOffset(self.arch.bits, arg.stack_offset), arg.size)
-                            ml_def = Definition(ml_atom, ExternalCodeLocation(),
+                            ml_def = Definition(ml_atom, ExternalCodeLocation(call_string),
                                                 tags={ParameterTag(function=func_addr)})
                             ml = self.annotate_with_def(self.top(self.arch.bits), ml_def)
                             stack_address = self.get_stack_address(self.stack_address(arg.stack_offset))
@@ -303,13 +303,13 @@ class ReachingDefinitionsState:
                 raise TypeError("rtoc_value must be provided on PPC64.")
             offset, size = self.arch.registers['rtoc']
             rtoc_atom = Register(offset, size)
-            rtoc_def = Definition(rtoc_atom, ExternalCodeLocation(), tags={InitialValueTag()})
+            rtoc_def = Definition(rtoc_atom, ExternalCodeLocation(call_string), tags={InitialValueTag()})
             rtoc = self.annotate_with_def(claripy.BVV(rtoc_value, self.arch.bits), rtoc_def)
             self.register_definitions.store(offset, rtoc)
         elif self.arch.name.startswith('MIPS64'):
             offset, size = self.arch.registers['t9']
             t9_atom = Register(offset, size)
-            t9_def = Definition(t9_atom, ExternalCodeLocation(), tags={InitialValueTag()})
+            t9_def = Definition(t9_atom, ExternalCodeLocation(call_string), tags={InitialValueTag()})
             t9 = self.annotate_with_def(claripy.BVV(func_addr, self.arch.bits), t9_def)
             self.register_definitions.store(offset, t9)
 
