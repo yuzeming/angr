@@ -1,12 +1,11 @@
 from itertools import combinations
 from typing import List
+import logging
 
 from ailment import Block, Const
 from ailment.expression import Convert, Load
-
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Call, Store
 import claripy
-
 from angr.knowledge_plugins.key_definitions.constants import OP_AFTER
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ....knowledge_plugins.key_definitions.atoms import MemoryLocation
@@ -15,6 +14,8 @@ from ..region_identifier import RegionIdentifier, MultiNode
 from ..utils import to_ail_supergraph
 
 from ... import AnalysesHub
+
+l = logging.getLogger(__name__)
 
 class CallArgSimplifier(OptimizationPass):
     """
@@ -56,6 +57,8 @@ class CallArgSimplifier(OptimizationPass):
                 if not closeness:
                     continue
 
+                l.info(f"Found two calls that are similar: {c1} <==> {c2} attempting to resolve const args now...")
+
                 c1, c2, diff_dict = closeness
                 for i, args in diff_dict.items():
                     a0, a1 = args[:]
@@ -81,7 +84,7 @@ class CallArgSimplifier(OptimizationPass):
                 if not state_load_vals:
                     continue
 
-                state_vals = state_load_vals.values
+                state_vals = list(state_load_vals.values())
                 if len(state_vals) > 1:
                     continue
 
@@ -94,9 +97,11 @@ class CallArgSimplifier(OptimizationPass):
                 if not const_value == const_arg.value:
                     continue
 
+                l.info(f"Constant argument at position {i} was resolved to symbolic arg {symb_call.args[i]}")
                 const_call.args[i] = symb_call.args[i]
-        except Exception:
-            return self.out_graph
+        except Exception as e:
+            l.warning(f"Encountered exception {e} while resolving call arguments")
+            return
 
 
     def _calls_close(self, call1: Call, call2: Call, diff_max=1):
@@ -113,9 +118,6 @@ class CallArgSimplifier(OptimizationPass):
 
             if len(diff_dict) + arg_len_diff > diff_max:
                 return False
-
-        print("WON THE CALL!")
-        print(f"{call1} ;;;;; {call2}")
 
         for _, args in diff_dict.items():
             if not any(isinstance(a, Const) for a in args):
