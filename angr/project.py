@@ -73,7 +73,9 @@ class Project:
     :param support_selfmodifying_code:  Whether we aggressively support self-modifying code. When enabled, emulation
                                         will try to read code from the current state instead of the original memory,
                                         regardless of the current memory protections.
-    :param profile:                     Enable profiling. Project.profiler will be created if it is set to True.
+    :param profile:                     Enable profiling. Project.profiler will be created if it is set to LOG PATH; 
+                                        read environment variable ANGR_PROFILE_LOG for log path if it is set to None;
+                                        Disabled for False.
     :param store_function:              A function that defines how the Project should be stored. Default to pickling.
     :param load_function:               A function that defines how the Project should be loaded. Default to unpickling.
     :param analyses_preset:             The plugin preset for the analyses provider (i.e. Analyses instance).
@@ -111,7 +113,7 @@ class Project:
                  load_function=None,
                  analyses_preset=None,
                  concrete_target=None,
-                 profile=False,
+                 profile=None,
                  **kwargs):
 
         # Step 1: Load the binary
@@ -232,8 +234,13 @@ class Project:
             self._register_object(obj, sim_proc_arch)
 
         # Step 7: Profiler
-        self.profiler = Profiling() if profile else None
-        if self.profiler:
+        self.profiler = None
+        
+        if profile is None:
+            profile = os.environ.get("ANGR_PROFILE_LOG", None)
+
+        if profile:
+            self.profiler = Profiling(profile)
             frame = inspect.currentframe()
             args, _, _, values = inspect.getargvalues(frame)
             self.profiler.project_created(self.filename, options=dict((arg, values[arg]) for arg in args))
