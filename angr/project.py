@@ -2,6 +2,7 @@ import inspect
 import logging
 import os
 import types
+import time
 from io import BytesIO, IOBase
 import pickle
 import string
@@ -243,6 +244,8 @@ class Project:
 
         if profile:
             profile = os.path.abspath(os.path.expanduser(profile))
+            if os.path.isdir(profile):
+                profile = os.path.join(profile, time.strftime("angr_%y%m%d_%H%M%S.log"))
             self.profiler = Profiling(profile)
             frame = inspect.currentframe()
             args, _, _, values = inspect.getargvalues(frame)
